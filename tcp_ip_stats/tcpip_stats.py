@@ -1,422 +1,312 @@
+import ctypes
+import os
+import socket
+import struct
+import time
+from collections import defaultdict
+
+# ========= 基本設定 =========
+STATS_MAP_PATH = "/sys/fs/bpf/ip/globals/tcp_flow_map"
+SYS_BPF = 321  # x86_64
+
+BPF_OBJ_GET = 7
+BPF_MAP_LOOKUP_ELEM = 1
+BPF_MAP_GET_NEXT_KEY = 4
+BPF_MAP_DELETE_ELEM = 2
+
+TCP_STATE_UNKNOWN = 0
+TCP_STATE_SYN_SENT = 1
+TCP_STATE_SYN_RECEIVED = 2
+TCP_STATE_ESTABLISHED = 3
 
-#include "vmlinux.h"
-
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_endian.h>
-
-#define ETH_P_IP     0x0800
-#define IPPROTO_TCP  6
-
-// TC actions
-#define TC_ACT_OK 0
-/*
- * TCP connection state
- */
-#define TCP_STATE_UNKNOWN       0
-#define TCP_STATE_SYN_SENT      1
-#define TCP_STATE_SYN_RECEIVED  2
-#define TCP_STATE_ESTABLISHED   3
-
-
-/*
- * TCP flow 的 key
- *
- * 例如：
- *
- * 192.168.1.100:54321
- *        ↓
- * 142.250.72.14:443
- */
-struct tcp_flow_key {
-    __u32 src_ip;
-    __u32 dst_ip;
-
-    __u16 src_port;
-    __u16 dst_port;
-
-    __u8  protocol;
-
-    // padding，讓 struct 對齊
-    __u8  pad[3];
-};
-
-
-/*
- * 每一個 TCP flow 的統計資料
- */
-struct tcp_flow_stats {
-    __u64 packets;
-    __u64 bytes;
-
-    /*
-     * 只統計握手階段的 SYN / ACK
-     *
-     * SYN:
-     *   SYN=1 ACK=0
-     *   SYN=1 ACK=1
-     *
-     * ACK:
-     *   只統計 SYN+ACK
-     *
-     *   不統計：
-     *   SYN=0 ACK=1
-     */
-    __u64 syn;
-    __u64 ack;
-
-    /*
-     * TCP connection state
-     */
-    __u8 connection_state;
-
-    /*
-     * padding
-     *
-     * 因為後面沒有其他欄位，
-     * 這裡不需要特別補到 8 bytes。
-     */
-    __u8 pad[7];
-
-    __u64 first_seen;
-    __u64 last_seen;
-};
-
-
-/*
- * TCP flow map
- *
- * key:
- *     struct tcp_flow_key
- *
- * value:
- *     struct tcp_flow_stats
- */
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
-    __uint(max_entries, 10000);
-
-    __type(key, struct tcp_flow_key);
-    __type(value, struct tcp_flow_stats);
-
-    __uint(pinning, LIBBPF_PIN_BY_NAME);
-} tcp_flow_map SEC(".maps");
+BUCKET_NS = 10_000_000_000
+TIMEOUT_BUCKETS = 3   # 超過 3 個 bucket 就刪
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+# ========= struct 定義（要和 eBPF 完全一致） =========
+
+class FlowKey(ctypes.Structure):
+    _fields_ = [
+        ("src_ip", ctypes.c_uint32),
+        ("dst_ip", ctypes.c_uint32),
 
+        ("src_port", ctypes.c_uint16),
+        ("dst_port", ctypes.c_uint16),
 
-SEC("tc")
-int tc_tcp_flow(struct __sk_buff *skb)
-{
-    void *data = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
+        ("protocol", ctypes.c_uint8),
+
+        # C struct alignment / padding
+        ("pad", ctypes.c_uint8 * 3),
+    ]
+
+class FlowStats(ctypes.Structure):
+    _fields_ = [
+        ("packets", ctypes.c_uint64),
+        ("bytes", ctypes.c_uint64),
 
+        ("syn", ctypes.c_uint64),
+        ("ack", ctypes.c_uint64),
+
+        ("connection_state", ctypes.c_uint8),
+        ("pad", ctypes.c_uint8 * 7),
 
-    /*
-     * ========================================
-     * Ethernet
-     * ========================================
-     */
+        ("first_seen", ctypes.c_uint64),
+        ("last_seen", ctypes.c_uint64),
+    ]
 
-    struct ethhdr *eth = data;
+# PERCPU array
+NCPU = os.cpu_count()
+StatsArray = FlowStats * NCPU
 
-    if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
+# ========= bpf_attr =========
 
+class BPFAttrObjGet(ctypes.Structure):
+    _fields_ = [
+        ("pathname", ctypes.c_uint64),
+        ("bpf_fd", ctypes.c_uint32),
+        ("file_flags", ctypes.c_uint32),
+    ]
 
-    /*
-     * 只處理 IPv4
-     */
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+class BPFAttrLookup(ctypes.Structure):
+    _fields_ = [
+        ("map_fd", ctypes.c_uint32),
+        ("key", ctypes.c_uint64),
+        ("value", ctypes.c_uint64),
+        ("flags", ctypes.c_uint64),
+    ]
 
+class BPFAttrGetNextKey(ctypes.Structure):
+    _fields_ = [
+        ("map_fd", ctypes.c_uint32),
+        ("key", ctypes.c_uint64),
+        ("next_key", ctypes.c_uint64),
+    ]
 
-    /*
-     * ========================================
-     * IPv4
-     * ========================================
-     */
+# ========= syscall wrapper =========
 
-    struct iphdr *ip = (void *)(eth + 1);
+def bpf_syscall(cmd, attr):
+    ret = libc.syscall(SYS_BPF, cmd, ctypes.byref(attr), ctypes.sizeof(attr))
+    if ret < 0:
+        err = ctypes.get_errno()
+        if err == 2:  # ENOENT
+            return None
+        raise OSError(err, os.strerror(err))
+    return ret
 
-    if ((void *)(ip + 1) > data_end)
-        return TC_ACT_OK;
+# ========= 打開 map =========
 
+def get_map_fd(path):
+    path_buf = ctypes.create_string_buffer(path.encode())
 
-    /*
-     * 只處理 TCP
-     */
-    if (ip->protocol != IPPROTO_TCP)
-        return TC_ACT_OK;
+    attr = BPFAttrObjGet()
+    attr.pathname = ctypes.addressof(path_buf)
 
+    return bpf_syscall(BPF_OBJ_GET, attr)
 
-    /*
-     * IPv4 header 長度
-     *
-     * ihl 的單位是 32-bit word
-     *
-     * ihl = 5
-     * 5 * 4 = 20 bytes
-     */
-    __u32 ip_header_len = ip->ihl * 4;
+def lookup_percpu(fd, key):
+    values = StatsArray()
 
-    if (ip_header_len < sizeof(struct iphdr))
-        return TC_ACT_OK;
+    attr = BPFAttrLookup()
+    attr.map_fd = fd
+    attr.key = ctypes.addressof(key)
+    attr.value = ctypes.addressof(values)
 
-    if ((void *)ip + ip_header_len > data_end)
-        return TC_ACT_OK;
+    bpf_syscall(BPF_MAP_LOOKUP_ELEM, attr)
+    return values
 
+def aggregate(values):
+    result = FlowStats()
 
-    /*
-     * ========================================
-     * TCP
-     * ========================================
-     */
+    result.packets = 0
+    result.bytes = 0
+    result.syn = 0
+    result.ack = 0
 
-    struct tcphdr *tcp =
-        (void *)ip + ip_header_len;
+    result.first_seen = 0
+    result.last_seen = 0
+    result.connection_state = 0
 
-    if ((void *)(tcp + 1) > data_end)
-        return TC_ACT_OK;
+    first = True
 
+    for v in values:
+        result.packets += v.packets
+        result.bytes += v.bytes
 
-    /*
-     * ========================================
-     * 建立 flow key
-     * ========================================
-     */
+        result.syn += v.syn
+        result.ack += v.ack
 
-    //----------- debug --------------------
-    unsigned char s[4], d[4];
-    s[0] = ip->saddr & 0xFF; s[1] = (ip->saddr >> 8) & 0xFF; s[2] = (ip->saddr >> 16) & 0xFF; s[3] = (ip->saddr >> 24) & 0xFF;
-    d[0] = ip->daddr & 0xFF; d[1] = (ip->daddr >> 8) & 0xFF; d[2] = (ip->daddr >> 16) & 0xFF; d[3] = (ip->daddr >> 24) & 0xFF;
+        # first_seen：取最早
+        if first or v.first_seen < result.first_seen:
+            result.first_seen = v.first_seen
 
-    bpf_printk("TC [IPv4]: %d.%d.%d.%d -> %d.%d.%d.%d\n",
-                   s[0], s[1], s[2], s[3],
-                   d[0], d[1], d[2], d[3]);
-    bpf_printk("syn : %d, ack : %d\n",tcp->syn,tcp->ack);
-    //----------- debug --------------------
+        # last_seen：取最新
+        if first or v.last_seen > result.last_seen:
+            result.last_seen = v.last_seen
 
-    struct tcp_flow_key key = {};
+        # state：假設每個 CPU 相同，取第一個
+        if first:
+            result.connection_state = v.connection_state
 
-    key.src_ip = ip->saddr;
-    key.dst_ip = ip->daddr;
+        first = False
 
-    key.src_port = tcp->source;
-    key.dst_port = tcp->dest;
+    return result
 
-    key.protocol = IPPROTO_TCP;
+def iterate_keys(fd):
+    keys = []
 
+    next_key = FlowKey()
+    key_ptr = 0  # 第一次傳 NULL
 
-    /*
-     * ========================================
-     * 取得目前時間
-     * ========================================
-     */
+    while True:
+        attr = BPFAttrGetNextKey()
+        attr.map_fd = fd
+        attr.key = key_ptr
+        attr.next_key = ctypes.addressof(next_key)
 
-    __u64 now = bpf_ktime_get_ns();
+        ret = bpf_syscall(BPF_MAP_GET_NEXT_KEY, attr)
+        if ret is None:
+            break
 
+        # copy key（避免被覆蓋）
+        k = FlowKey()
+        ctypes.memmove(ctypes.byref(k), ctypes.byref(next_key), ctypes.sizeof(FlowKey))
+        keys.append(k)
 
-    /*
-     * ========================================
-     * 取得 TCP flags
-     * ========================================
-     */
+        key_ptr = ctypes.addressof(next_key)
 
-    __u8 syn = tcp->syn;
-    __u8 ack = tcp->ack;
+    return keys
 
+AF_INET = 2
+AF_INET6 = 10
 
-    /*
-     * ========================================
-     * 查詢 flow
-     * ========================================
-     */
+# ========= 主程式 =========
 
-    struct tcp_flow_stats *stats;
 
-    stats = bpf_map_lookup_elem(
-        &tcp_flow_map,
-        &key
-    );
+def main():
+    stats_fd = get_map_fd(STATS_MAP_PATH)
 
+    while True:
 
-    /*
-     * ========================================
-     * 第一次看到這個 flow
-     * ========================================
-     */
+        # ========================================
+        # 每一秒重新統計
+        # ========================================
 
-    if (!stats) {
+        total_packets = 0
 
-        struct tcp_flow_stats new_stats = {};
+        # SYN=1 ACK=0 的封包數量
+        syn_only_packets = 0
 
-        /*
-         * 所有 TCP 封包都計算
-         */
-        new_stats.packets = 1;
-        new_stats.bytes = skb->len;
+        # SYN=1 ACK=1 的封包數量
+        syn_ack_packets = 0
 
+        # 傳送 SYN=1 ACK=0 的不同來源 IP
+        syn_source_ips = set()
 
-        /*
-         * ====================================
-         * SYN / ACK 統計
-         * ====================================
-         *
-         * SYN=1 ACK=0
-         *     → SYN++
-         *
-         * SYN=1 ACK=1
-         *     → SYN++
-         *     → ACK++
-         *
-         * SYN=0 ACK=1
-         *     → 不增加 ACK
-         */
+        # SYN=1 ACK=0 的不同 flow key 數量
+        syn_flows = set()
 
-        if (syn) {
-            new_stats.syn++;
-        }
+        # 完成 TCP handshake 的連線數
+        established_connections = 0
 
-        if (syn && ack) {
-            new_stats.ack++;
-        }
 
+        # ========================================
+        # 取得目前所有 flow
+        # ========================================
 
-        /*
-         * ====================================
-         * connection state
-         * ====================================
-         */
+        keys = iterate_keys(stats_fd)
 
-        if (syn && !ack) {
 
-            /*
-             * SYN
-             */
-            new_stats.connection_state =
-                TCP_STATE_SYN_SENT;
+        for key in keys:
 
-        }
-        else if (syn && ack) {
+            # ------------------------------------
+            # 取得 PERCPU value
+            # ------------------------------------
 
-            /*
-             * SYN + ACK
-             */
-            new_stats.connection_state =
-                TCP_STATE_SYN_RECEIVED;
+            values = lookup_percpu(stats_fd, key)
 
-        }
-        else {
+            result = aggregate(values)
 
-            /*
-             * 如果第一個看到的封包不是
-             * SYN / SYN+ACK，
-             * 無法確定握手狀態。
-             */
-            new_stats.connection_state =
-                TCP_STATE_UNKNOWN;
-        }
 
+            # ====================================
+            # 1. TCP 封包數量
+            # ====================================
 
-        /*
-         * ====================================
-         * 時間
-         * ====================================
-         */
+            total_packets += result.packets
 
-        new_stats.first_seen = now;
-        new_stats.last_seen = now;
 
+            # ====================================
+            # 2. SYN=1 ACK=0 封包數量
+            #
+            # syn = SYN + SYN/ACK
+            # ack = SYN/ACK
+            #
+            # 所以：
+            #
+            # SYN only = syn - ack
+            # ====================================
 
-        /*
-         * ====================================
-         * 插入 map
-         * ====================================
-         */
+            syn_only = result.syn - result.ack
 
-        bpf_map_update_elem(
-            &tcp_flow_map,
-            &key,
-            &new_stats,
-            BPF_ANY
-        );
+            syn_only_packets += syn_only
 
-        return TC_ACT_OK;
-    }
 
+            # ====================================
+            # 3. SYN=1 ACK=1 封包數量
+            # ====================================
 
-    /*
-     * ========================================
-     * 已經存在的 flow
-     * ========================================
-     */
+            syn_ack_packets += result.ack
 
-    /*
-     * 所有 TCP 封包都統計
-     */
-    stats->packets++;
-    stats->bytes += skb->len;
 
+            # ====================================
+            # 4. 傳送 SYN=1 ACK=0 的不同來源 IP
+            # ====================================
 
-    /*
-     * ========================================
-     * SYN / ACK / connection state
-     * ========================================
-     */
+            if syn_only > 0:
 
-    if (syn && !ack) {
+                src_ip = key.src_ip
 
-        /*
-         * SYN
-         *
-         * SYN=1 ACK=0
-         */
-        stats->syn++;
+                syn_source_ips.add(src_ip)
 
-        stats->connection_state =
-            TCP_STATE_SYN_SENT;
-    }
-    else if (syn && ack) {
 
-        /*
-         * SYN + ACK
-         *
-         * SYN=1 ACK=1
-         */
-        stats->syn++;
-        stats->ack++;
+                # =================================
+                # 5. SYN=1 ACK=0 不同 key 數量
+                # =================================
 
-        stats->connection_state =
-            TCP_STATE_SYN_RECEIVED;
-    }
-    else if (!syn && ack) {
+                syn_flows.add(bytes(key))
 
-        /*
-         * 第三次握手：
-         *
-         * SYN=0 ACK=1
-         *
-         * 只改變 connection_state
-         *
-         * 不：
-         *     stats->ack++;
-         */
 
-        stats->connection_state =
-            TCP_STATE_ESTABLISHED;
-    }
+            # ====================================
+            # 6. 完成 TCP handshake 的連線數
+            # ====================================
 
+            if result.connection_state == TCP_STATE_ESTABLISHED:
+                established_connections += 1
 
-    /*
-     * ========================================
-     * 更新最後看到時間
-     * ========================================
-     */
 
-    stats->last_seen = now;
+        # ========================================
+        # 輸出
+        # ========================================
 
+        print("----------------------------------------")
+        print(f"TCP 封包數量                    : {total_packets}")
+        print(f"SYN=1 ACK=0 封包數量            : {syn_only_packets}")
+        print(f"SYN=1 ACK=1 封包數量            : {syn_ack_packets}")
+        print(f"SYN來源 IP 數量                  : {len(syn_source_ips)}")
+        print(f"SYN 不同 Flow 數量               : {len(syn_flows)}")
+        print(f"完成 TCP handshake 連線數        : {established_connections}")
 
-    return TC_ACT_OK;
-}
 
+        # ========================================
+        # 每秒更新一次
+        # ========================================
 
-char LICENSE[] SEC("license") = "GPL";
+        time.sleep(1)
 
+
+    
+
+
+
+if __name__ == "__main__":
+    main()
