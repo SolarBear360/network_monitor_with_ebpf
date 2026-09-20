@@ -32,4 +32,35 @@ ebpf map如下 :
 ## 補充說明
 - 收到syn=1,ack=0或syn=1,ack=1兩種封包，則數值為1的欄位加1
 - 當收到syn=0,ack=1視為完成三項交握,ack欄位不加1
-- 目前python是1秒讀1次，所以第七點**當下這一秒開始時間**可以都以隔一秒計算。time_bucket是有比現在更好的寫法，但是在我的機器上嘗試讀取那種寫法的map時會出錯，如果真的行不通的話，這些數值或許就用每段時間累加，再跟前一段時間的數值相減取差值
+- 目前python是1秒讀1次，所以第七點**當下這一秒開始時間**可以都以隔一秒計算。
+
+## 更新
+
+現在tcp_ip_stats有4個檔案
+- init.sh
+- tc_tcpip_stats.c
+- tcpip_pakage_expire.py
+- tcpip_stats.py
+
+### tc_tcpip_stats.c
+- ebpf 程式
+
+### init.sh
+- 根據說明使用，用於掛載ebpf程式。
+
+
+### tcpip_pakage_expire.py
+- 刪除過期資料
+
+
+### tcpip_stats.py
+- 顯示統計數據
+
+---
+
+執行時，請按照以下順序:
+1. 執行init.sh，掛載ebpf程式
+2. 執行tcpip_pakage_expire.py
+
+因為ebpf程式中使用了兩層map。掛載時，會先創立外層的map，再由tcpip_pakage_expire.py建立內部的map。過程中會有file directory相關操作，如果關閉了tcpip_pakage_expire.py，請務必也重新掛載ebpf程式(重新執行init.sh)，否則tcpip_pakage_expire.py會抓不到內部的file directory。
+
