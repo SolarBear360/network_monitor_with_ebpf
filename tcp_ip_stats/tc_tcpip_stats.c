@@ -1,14 +1,24 @@
-
+//==============================================
 #include "vmlinux.h"
-
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-#define ETH_P_IP     0x0800
-#define IPPROTO_TCP  6
+#define BPF_NO_PRESERVE_ACCESS_INDEX
 
 // TC actions
 #define TC_ACT_OK 0
+
+// Ethernet protocol
+#define ETH_P_IP   0x0800
+#define IPPROTO_TCP  6
+
+// Address family
+#define AF_INET   2
+#define AF_INET6 10
+
+#define BUCKET_NS 1000000000ULL  // 1 秒
+#define NUM_BUCKETS 64
+
 /*
  * TCP connection state
  */
@@ -17,16 +27,6 @@
 #define TCP_STATE_SYN_RECEIVED  2
 #define TCP_STATE_ESTABLISHED   3
 
-
-/*
- * TCP flow 的 key
- *
- * 例如：
- *
- * 192.168.1.100:54321
- *        ↓
- * 142.250.72.14:443
- */
 struct tcp_flow_key {
     __u32 src_ip;
     __u32 dst_ip;
@@ -64,9 +64,6 @@ struct tcp_flow_stats {
     __u64 syn;
     __u64 ack;
 
-    /*
-     * TCP connection state
-     */
     __u8 connection_state;
 
     /*
@@ -82,32 +79,51 @@ struct tcp_flow_stats {
 };
 
 
-/*
- * TCP flow map
- *
- * key:
- *     struct tcp_flow_key
- *
- * value:
- *     struct tcp_flow_stats
- */
+// ========================
+// ① 主統計 map（不變）
+// ========================
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
     __uint(max_entries, 10000);
-
     __type(key, struct tcp_flow_key);
     __type(value, struct tcp_flow_stats);
-
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } tcp_flow_map SEC(".maps");
 
+// ========================
+// ③ bucket array（queue）
+// ========================
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+    __uint(max_entries, NUM_BUCKETS);
+    __type(key, __u32);
+
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+    __array(values, struct  {
+        __uint(type, BPF_MAP_TYPE_HASH);
+        __uint(max_entries, 4096);
+        __type(key, struct tcp_flow_key);
+        __type(value, __u8);
+    });
+} tcp_bucket_maps SEC(".maps");
+
+
+// ========================
+// ④ current bucket index
+// ========================
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} tcp_current_bucket SEC(".maps");
 
 SEC("tc")
 int tc_tcp_flow(struct __sk_buff *skb)
 {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
-
 
     /*
      * ========================================
@@ -151,9 +167,6 @@ int tc_tcp_flow(struct __sk_buff *skb)
      * IPv4 header 長度
      *
      * ihl 的單位是 32-bit word
-     *
-     * ihl = 5
-     * 5 * 4 = 20 bytes
      */
     __u32 ip_header_len = ip->ihl * 4;
 
@@ -176,13 +189,6 @@ int tc_tcp_flow(struct __sk_buff *skb)
     if ((void *)(tcp + 1) > data_end)
         return TC_ACT_OK;
 
-
-    /*
-     * ========================================
-     * 建立 flow key
-     * ========================================
-     */
-
     //----------- debug --------------------
     unsigned char s[4], d[4];
     s[0] = ip->saddr & 0xFF; s[1] = (ip->saddr >> 8) & 0xFF; s[2] = (ip->saddr >> 16) & 0xFF; s[3] = (ip->saddr >> 24) & 0xFF;
@@ -194,6 +200,11 @@ int tc_tcp_flow(struct __sk_buff *skb)
     bpf_printk("syn : %d, ack : %d\n",tcp->syn,tcp->ack);
     //----------- debug --------------------
 
+    /*
+     * ========================================
+     * 建立 flow key
+     * ========================================
+     */
     struct tcp_flow_key key = {};
 
     key.src_ip = ip->saddr;
@@ -204,15 +215,13 @@ int tc_tcp_flow(struct __sk_buff *skb)
 
     key.protocol = IPPROTO_TCP;
 
-
-    /*
-     * ========================================
-     * 取得目前時間
-     * ========================================
-     */
-
+    // ---------- 計算 bucket ----------
     __u64 now = bpf_ktime_get_ns();
+    __u32 bucket = (now / BUCKET_NS) % NUM_BUCKETS;
 
+    // 更新 current bucket
+    __u32 idx0 = 0;
+    bpf_map_update_elem(&tcp_current_bucket, &idx0, &bucket, BPF_ANY);
 
     /*
      * ========================================
@@ -237,7 +246,6 @@ int tc_tcp_flow(struct __sk_buff *skb)
         &key
     );
 
-
     /*
      * ========================================
      * 第一次看到這個 flow
@@ -245,7 +253,7 @@ int tc_tcp_flow(struct __sk_buff *skb)
      */
 
     if (!stats) {
-
+        bpf_printk("---------------stats---------------\n");
         struct tcp_flow_stats new_stats = {};
 
         /*
@@ -325,6 +333,22 @@ int tc_tcp_flow(struct __sk_buff *skb)
         new_stats.first_seen = now;
         new_stats.last_seen = now;
 
+        // ---------- 寫入 bucket map ----------
+        // 看當前的bucket 有沒有這個key，沒有則將這個key寫進去。
+        // 例: 連續兩秒寫入封包，上一個bucket和下一個bucket都會有這個key
+        // tcp_stats_map則會記錄last_seen
+        void *inner_map = bpf_map_lookup_elem(&tcp_bucket_maps, &bucket);
+
+        if (!inner_map) {
+            bpf_printk("inner_map is NULL!\n");
+        }
+        
+        if (inner_map) {
+            __u8 one = 1;
+            bpf_printk("into bucket: %p \n",bucket);
+            // 用 NOEXIST → 避免重複寫入（變 set）
+            bpf_map_update_elem(inner_map, &key, &one, BPF_NOEXIST);
+        }
 
         /*
          * ====================================
@@ -341,82 +365,79 @@ int tc_tcp_flow(struct __sk_buff *skb)
 
         return TC_ACT_OK;
     }
-
-
     /*
-     * ========================================
-     * 已經存在的 flow
-     * ========================================
-     */
-
-    /*
-     * 所有 TCP 封包都統計
-     */
-    stats->packets++;
-    stats->bytes += skb->len;
-
-
-    /*
-     * ========================================
-     * SYN / ACK / connection state
-     * ========================================
-     */
-
-    if (syn && !ack) {
+        * ========================================
+        * 已經存在的 flow
+        * ========================================
+        */
 
         /*
-         * SYN
-         *
-         * SYN=1 ACK=0
-         */
-        stats->syn++;
+        * 所有 TCP 封包都統計
+        */
+        stats->packets++;
+        stats->bytes += skb->len;
 
-        stats->connection_state =
-            TCP_STATE_SYN_SENT;
-    }
-    else if (syn && ack) {
 
         /*
-         * SYN + ACK
-         *
-         * SYN=1 ACK=1
-         */
-        stats->syn++;
-        stats->ack++;
+        * ========================================
+        * SYN / ACK / connection state
+        * ========================================
+        */
 
-        stats->connection_state =
-            TCP_STATE_SYN_RECEIVED;
-    }
-    else if (!syn && ack) {
+        if (syn && !ack) {
+
+            /*
+            * SYN
+            *
+            * SYN=1 ACK=0
+            */
+            stats->syn++;
+
+            stats->connection_state = TCP_STATE_SYN_SENT;
+        }
+        else if (syn && ack) {
+
+            /*
+            * SYN + ACK
+            *
+            * SYN=1 ACK=1
+            */
+            stats->syn++;
+            stats->ack++;
+
+            stats->connection_state =
+                TCP_STATE_SYN_RECEIVED;
+        }
+        else if (!syn && ack) {
+
+            /*
+            * 第三次握手：
+            *
+            * SYN=0 ACK=1
+            *
+            * 只改變 connection_state
+            *
+            * 不：
+            *     stats->ack++;
+            */
+
+            stats->connection_state =
+                TCP_STATE_ESTABLISHED;
+        }
+
 
         /*
-         * 第三次握手：
-         *
-         * SYN=0 ACK=1
-         *
-         * 只改變 connection_state
-         *
-         * 不：
-         *     stats->ack++;
-         */
+        * ========================================
+        * 更新最後看到時間
+        * ========================================
+        */
 
-        stats->connection_state =
-            TCP_STATE_ESTABLISHED;
-    }
+        stats->last_seen = now;
 
 
-    /*
-     * ========================================
-     * 更新最後看到時間
-     * ========================================
-     */
-
-    stats->last_seen = now;
+        return TC_ACT_OK;
 
 
-    return TC_ACT_OK;
 }
 
-
-char LICENSE[] SEC("license") = "GPL";
-
+char _license[] SEC("license") = "GPL";

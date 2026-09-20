@@ -82,6 +82,8 @@ echo "[3.5] 正在清理舊的 Pinned Map 檔案以利重建..."
 # 1. 定義所有可能出現 pkt_stats_map 的路徑
 MAP_PATHS=(
     "/sys/fs/bpf/ip/globals/tcp_flow_map"
+    "/sys/fs/bpf/ip/globals/tcp_bucket_maps"
+    "/sys/fs/bpf/ip/globals/tcp_current_bucket"
 )
 echo "DEBUG in networkflow_detect_init.sh ${MAP_PATHS[@]}"
 # 2. 循環檢查並強制刪除
