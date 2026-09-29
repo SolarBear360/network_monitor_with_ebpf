@@ -44,17 +44,21 @@ ebpf map如下 :
 
 ### tc_tcpip_stats.c
 - ebpf 程式
+- 紀錄收集到的封包資訊
 
 ### init.sh
 - 根據說明使用，用於掛載ebpf程式。
 
 
 ### tcpip_pakage_expire.py
-- 刪除過期資料
+- 刪除過期資料，超過30秒未傳送封包的ip的所有紀錄會被刪除
+- 只記錄伺服器接收到的封包
+- 執行時需要一個參數:被偵測的容器的ip,可以進入容器的互動模式查看其中的eth0 ip
 
 
 ### tcpip_stats.py
 - 顯示統計數據
+- 輸出csv檔案
 
 ---
 
