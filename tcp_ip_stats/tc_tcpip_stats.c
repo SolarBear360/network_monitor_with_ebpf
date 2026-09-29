@@ -119,6 +119,14 @@ struct {
     __uint(pinning, LIBBPF_PIN_BY_NAME);
 } tcp_current_bucket SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} target_ip_map SEC(".maps");
+
 SEC("tc")
 int tc_tcp_flow(struct __sk_buff *skb)
 {
@@ -182,6 +190,20 @@ int tc_tcp_flow(struct __sk_buff *skb)
      * TCP
      * ========================================
      */
+
+    __u32 host_ip_key = 0;
+    __u32 *host_ip;
+
+    host_ip = bpf_map_lookup_elem(&target_ip_map, &host_ip_key);
+    unsigned char hostIP_display[4];
+    hostIP_display[0] = *host_ip & 0xFF; hostIP_display[1] = (*host_ip >> 8) & 0xFF; hostIP_display[2] = (*host_ip >> 16) & 0xFF; hostIP_display[3] = (*host_ip >> 24) & 0xFF;
+
+    bpf_printk("host ip: %d.%d.%d.%d\n",hostIP_display[0], hostIP_display[1], hostIP_display[2], hostIP_display[3]);
+
+    if (host_ip && ip->saddr == *host_ip) {
+        bpf_printk("packet send from host\n");
+        return TC_ACT_OK;
+    }
 
     struct tcphdr *tcp =
         (void *)ip + ip_header_len;

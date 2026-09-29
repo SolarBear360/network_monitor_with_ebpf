@@ -5,6 +5,13 @@ import struct
 import time
 from collections import defaultdict
 
+import csv
+import time
+from datetime import datetime
+
+
+CSV_FILE = "tcp_stats.csv"
+
 # ========= 基本設定 =========
 STATS_MAP_PATH = "/sys/fs/bpf/ip/globals/tcp_flow_map"
 SYS_BPF = 321  # x86_64
@@ -19,8 +26,8 @@ TCP_STATE_SYN_SENT = 1
 TCP_STATE_SYN_RECEIVED = 2
 TCP_STATE_ESTABLISHED = 3
 
-BUCKET_NS = 10_000_000_000
-TIMEOUT_BUCKETS = 3   # 超過 3 個 bucket 就刪
+AF_INET = 2
+AF_INET6 = 10
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
@@ -116,6 +123,7 @@ def lookup_percpu(fd, key):
     return values
 
 def aggregate(values):
+    #整合每個cpu內的值
     result = FlowStats()
 
     result.packets = 0
@@ -177,131 +185,218 @@ def iterate_keys(fd):
 
     return keys
 
-AF_INET = 2
-AF_INET6 = 10
 
 # ========= 主程式 =========
 
 
 def main():
+
     stats_fd = get_map_fd(STATS_MAP_PATH)
 
-    while True:
+    # ========================================
+    # 開啟 CSV
+    # ========================================
 
-        # ========================================
-        # 每一秒重新統計
-        # ========================================
+    with open(CSV_FILE, "a", newline="") as csv_file:
 
-        total_packets = 0
+        writer = csv.writer(csv_file)
 
-        # SYN=1 ACK=0 的封包數量
-        syn_only_packets = 0
+        # 如果是新的 CSV，寫入 header
+        if csv_file.tell() == 0:
+            writer.writerow([
+                "timestamp",
+                "tcp_packets",
+                "tcp_bytes",
+                "syn_only_packets",
+                "syn_ack_packets",
+                "syn_source_ips",
+                "syn_flows",
+                "established_connections"
+            ])
 
-        # SYN=1 ACK=1 的封包數量
-        syn_ack_packets = 0
-
-        # 傳送 SYN=1 ACK=0 的不同來源 IP
-        syn_source_ips = set()
-
-        # SYN=1 ACK=0 的不同 flow key 數量
-        syn_flows = set()
-
-        # 完成 TCP handshake 的連線數
-        established_connections = 0
-
-
-        # ========================================
-        # 取得目前所有 flow
-        # ========================================
-
-        keys = iterate_keys(stats_fd)
+            csv_file.flush()
 
 
-        for key in keys:
+        # ====================================
+        # 上一次的累積值
+        # ====================================
 
-            # ------------------------------------
-            # 取得 PERCPU value
-            # ------------------------------------
-
-            values = lookup_percpu(stats_fd, key)
-
-            result = aggregate(values)
-
-
-            # ====================================
-            # 1. TCP 封包數量
-            # ====================================
-
-            total_packets += result.packets
+        previous_packets = 0
+        previous_bytes = 0
+        previous_syn_only = 0
+        previous_syn_ack = 0
 
 
-            # ====================================
-            # 2. SYN=1 ACK=0 封包數量
+        while True:
+
+            # ========================================
+            # 每一秒重新統計
+            # ========================================
+
+            total_packets = 0
+            total_bytes = 0
+
+            syn_only_packets = 0
+            syn_ack_packets = 0
+
+            syn_source_ips = set()
+            syn_flows = set()
+
+            established_connections = 0
+
+
+            # ========================================
+            # 取得目前所有 flow
+            # ========================================
+
+            keys = iterate_keys(stats_fd)
+
+
+            for key in keys:
+
+                # ------------------------------------
+                # 取得 PERCPU value
+                # ------------------------------------
+
+                values = lookup_percpu(stats_fd, key)
+
+                result = aggregate(values)
+
+
+                # ====================================
+                # 1. TCP 封包數量
+                # ====================================
+
+                total_packets += result.packets
+
+
+                # ====================================
+                # 2. TCP bytes
+                # ====================================
+
+                total_bytes += result.bytes
+
+
+                # ====================================
+                # 3. SYN=1 ACK=0
+                # ====================================
+
+                syn_only = result.syn - result.ack
+
+                syn_only_packets += syn_only
+
+
+                # ====================================
+                # 4. SYN=1 ACK=1
+                # ====================================
+
+                syn_ack_packets += result.ack
+
+
+                # ====================================
+                # 5. SYN source IP
+                # ====================================
+
+                if syn_only > 0:
+
+                    src_ip = key.src_ip
+
+                    syn_source_ips.add(src_ip)
+
+                    # 不同 SYN flow
+                    syn_flows.add(bytes(key))
+
+
+                # ====================================
+                # 6. Established
+                # ====================================
+
+                if result.connection_state == TCP_STATE_ESTABLISHED:
+                    established_connections += 1
+
+
+            # ========================================
+            # 計算「這一秒」增加多少
+            # ========================================
+
+            interval_packets = total_packets - previous_packets
+            interval_bytes = total_bytes - previous_bytes
+
+            interval_syn_only = syn_only_packets - previous_syn_only
+            interval_syn_ack = syn_ack_packets - previous_syn_ack
+
+
+            # ========================================
+            # 第一次執行
             #
-            # syn = SYN + SYN/ACK
-            # ack = SYN/ACK
-            #
-            # 所以：
-            #
-            # SYN only = syn - ack
-            # ====================================
+            # 如果不想讓第一次包含程式啟動前
+            # 已經存在的封包，可以設定為 0。
+            # ========================================
 
-            syn_only = result.syn - result.ack
-
-            syn_only_packets += syn_only
+            if previous_packets == 0:
+                interval_packets = total_packets
+                interval_bytes = total_bytes
+                interval_syn_only = syn_only_packets
+                interval_syn_ack = syn_ack_packets
 
 
-            # ====================================
-            # 3. SYN=1 ACK=1 封包數量
-            # ====================================
+            # ========================================
+            # 更新 previous
+            # ========================================
 
-            syn_ack_packets += result.ack
-
-
-            # ====================================
-            # 4. 傳送 SYN=1 ACK=0 的不同來源 IP
-            # ====================================
-
-            if syn_only > 0:
-
-                src_ip = key.src_ip
-
-                syn_source_ips.add(src_ip)
+            previous_packets = total_packets
+            previous_bytes = total_bytes
+            previous_syn_only = syn_only_packets
+            previous_syn_ack = syn_ack_packets
 
 
-                # =================================
-                # 5. SYN=1 ACK=0 不同 key 數量
-                # =================================
+            # ========================================
+            # 時間
+            # ========================================
 
-                syn_flows.add(bytes(key))
-
-
-            # ====================================
-            # 6. 完成 TCP handshake 的連線數
-            # ====================================
-
-            if result.connection_state == TCP_STATE_ESTABLISHED:
-                established_connections += 1
+            timestamp = datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
 
 
-        # ========================================
-        # 輸出
-        # ========================================
+            # ========================================
+            # 終端輸出
+            # ========================================
 
-        print("----------------------------------------")
-        print(f"TCP 封包數量                    : {total_packets}")
-        print(f"SYN=1 ACK=0 封包數量            : {syn_only_packets}")
-        print(f"SYN=1 ACK=1 封包數量            : {syn_ack_packets}")
-        print(f"SYN來源 IP 數量                  : {len(syn_source_ips)}")
-        print(f"SYN 不同 Flow 數量               : {len(syn_flows)}")
-        print(f"完成 TCP handshake 連線數        : {established_connections}")
+            print("----------------------------------------")
+            print(f"TCP 封包數量                    : {interval_packets}")
+            print(f"TCP bytes                       : {interval_bytes}")
+            print(f"SYN=1 ACK=0 封包數量            : {interval_syn_only}")
+            print(f"SYN=1 ACK=1 封包數量            : {interval_syn_ack}")
+            print(f"SYN來源 IP 數量                  : {len(syn_source_ips)}")
+            print(f"SYN 不同 Flow 數量               : {len(syn_flows)}")
+            print(f"完成 TCP handshake 連線數        : {established_connections}")
 
 
-        # ========================================
-        # 每秒更新一次
-        # ========================================
+            # ========================================
+            # 寫入 CSV
+            # ========================================
 
-        time.sleep(1)
+            writer.writerow([
+                timestamp,
+                interval_packets,
+                interval_bytes,
+                interval_syn_only,
+                interval_syn_ack,
+                len(syn_source_ips),
+                len(syn_flows),
+                established_connections
+            ])
+
+            # 立即寫入檔案
+            csv_file.flush()
+
+
+            # ========================================
+            # 每秒更新
+            # ========================================
+
+            time.sleep(1)
 
 
     

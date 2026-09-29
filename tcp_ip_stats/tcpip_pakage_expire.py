@@ -3,12 +3,14 @@ import os
 import socket
 import struct
 import time
+import sys
 from collections import defaultdict
 
 # ========= 基本設定 =========
 STATS_MAP_PATH = "/sys/fs/bpf/ip/globals/tcp_flow_map"
 BUCKET_MAP_PATH = "/sys/fs/bpf/ip/globals/tcp_bucket_maps"
 CURRENT_BUCKET_PATH = "/sys/fs/bpf/ip/globals/tcp_current_bucket"
+TARGET_IP_MAP_PATH = "/sys/fs/bpf/ip/globals/target_ip_map"
 
 SYS_BPF = 321  # x86_64
 
@@ -18,6 +20,7 @@ BPF_MAP_GET_NEXT_KEY = 4
 BPF_MAP_DELETE_ELEM = 3
 BPF_MAP_UPDATE_ELEM = 2
 BPF_MAP_CREATE = 0
+BPF_ANY = 0
 
 BPF_MAP_GET_FD_BY_ID = 14
 
@@ -26,7 +29,7 @@ BPF_MAP_TYPE_HASH = 1
 
 NUM_BUCKETS = 64
 
-BUCKET_NS = 10_000_000_00 # 1秒
+BUCKET_NS = 30_000_000_000 # 30秒
 TIMEOUT_BUCKETS = 3   # 超過 3 個 bucket 就刪
 
 
@@ -437,9 +440,50 @@ def init_buckets(bucket_fd):
 
         os.close(inner_fd)
 
+def struct_ip_to_u32(ip):
+    packed = socket.inet_aton(ip)
+    return int.from_bytes(packed, byteorder="little")
+
+def set_target_ip(map_fd, ip):
+    # key = 0，因為 ARRAY map 只有一個 entry
+    key = ctypes.c_uint32(0)
+
+    # 將 IPv4 字串轉成 network byte order
+    ip_value = struct_ip_to_u32(ip)
+
+    value = ctypes.c_uint32(ip_value)
+
+    attr = BPFAttrUpdate()
+    attr.map_fd = map_fd
+    attr.key = ctypes.addressof(key)
+    attr.value = ctypes.addressof(value)
+    attr.flags = BPF_ANY
+
+    bpf_syscall(BPF_MAP_UPDATE_ELEM, attr)
+
+
+
 # ========= 主程式 =========
 
 def main():
+    if len(sys.argv) != 2:
+        print(f"Usage: sudo python3 {sys.argv[0]} <IP>")
+        print(f"Example: sudo python3 {sys.argv[0]} 8.8.8.8")
+        sys.exit(1)
+
+    ip = sys.argv[1]
+
+    # 確認是不是合法 IPv4
+    try:
+        socket.inet_aton(ip)
+    except OSError:
+        print(f"Invalid IPv4 address: {ip}")
+        sys.exit(1)
+
+    map_fd = get_map_fd(TARGET_IP_MAP_PATH)
+
+    set_target_ip(map_fd, ip)
+    
     stats_fd = get_map_fd(STATS_MAP_PATH)
     bucket_fd = get_map_fd(BUCKET_MAP_PATH)
     current_bucket_fd = get_map_fd(CURRENT_BUCKET_PATH)
