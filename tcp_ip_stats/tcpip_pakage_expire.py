@@ -4,6 +4,7 @@ import socket
 import struct
 import time
 import sys
+import ipaddress
 from collections import defaultdict
 
 # ========= 基本設定 =========
@@ -29,12 +30,18 @@ BPF_MAP_TYPE_HASH = 1
 
 NUM_BUCKETS = 64
 
-BUCKET_NS = 10_000_000_000 # 10秒
-TIMEOUT_BUCKETS = 3   # 超過 3 個 bucket 就刪
+#---------------------------------------------------
+BUCKET_NS = 10_000_000_00 # 1秒
+TIMEOUT_BUCKETS = 30   # 超過 30 個 bucket 就刪
 
+TIMEOUT_SECONDS = 30
+TIMEOUT_NS = TIMEOUT_SECONDS * 1_000_000_000
+#---------------------------------------------------
 
 AF_INET = 2
 AF_INET6 = 10
+
+
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
@@ -275,97 +282,96 @@ def lookup_inner_map_fd(outer_fd, index):
 
     inner_map_id = value.value
 
-    print(
-        f"[DEBUG] bucket={index}, "
-        f"inner_map_id={inner_map_id}"
-    )
+    # print(
+    #     f"[DEBUG] bucket={index}, "
+    #     f"inner_map_id={inner_map_id}"
+    # )
 
     inner_fd = get_map_fd_by_id(inner_map_id)
 
-    print(
-        f"[DEBUG] inner_map_id={inner_map_id} "
-        f"-> inner_fd={inner_fd}"
-    )
+    # print(
+    #     f"[DEBUG] inner_map_id={inner_map_id} "
+    #     f"-> inner_fd={inner_fd}"
+    # )
 
     return inner_fd
 
+def iterate_keys(fd):
+    keys = []
+
+    next_key = FlowKey()
+    key_ptr = 0  # 第一次傳 NULL
+
+    while True:
+        attr = BPFAttrGetNextKey()
+        attr.map_fd = fd
+        attr.key = key_ptr
+        attr.next_key = ctypes.addressof(next_key)
+
+        ret = bpf_syscall(BPF_MAP_GET_NEXT_KEY, attr)
+        if ret is None:
+            break
+
+        # copy key（避免被覆蓋）
+        k = FlowKey()
+        ctypes.memmove(ctypes.byref(k), ctypes.byref(next_key), ctypes.sizeof(FlowKey))
+        keys.append(k)
+
+        key_ptr = ctypes.addressof(next_key)
+
+    return keys
 #============== bucket 相關動作 function ===================
 def current_bucket():
     return time.monotonic_ns() // BUCKET_NS
 
-def map_key_exists(fd, key):
-    value = ctypes.c_uint8()
-
-    attr = BPFAttrLookup()
-    attr.map_fd = fd
-    attr.key = ctypes.addressof(key)
-    attr.value = ctypes.addressof(value)
-
-    ret = bpf_syscall(BPF_MAP_LOOKUP_ELEM, attr)
-
-    return ret is not None
-
-def exists_in_other_buckets(bucket_fd, expired_idx, key):
-    for i in range(NUM_BUCKETS):
-        if i == expired_idx:
-            continue
-
-        inner_fd = lookup_inner_map_fd(bucket_fd, i)
-
-        if inner_fd is None:
-            continue
-
-        try:
-            if map_key_exists(inner_fd, key):
-                return True
-        finally:
-            os.close(inner_fd)
-
-    return False
-
 def clear_bucket(stats_fd, bucket_fd, expired_idx, inner_fd):
-    while True:
-        next_key = FlowKey()
+    now_ns = time.monotonic_ns()
 
-        attr = BPFAttrGetNextKey()
-        attr.map_fd = inner_fd
-        attr.key = 0
-        attr.next_key = ctypes.addressof(next_key)
+    keys = iterate_keys(inner_fd)
 
-        ret = bpf_syscall(
-            BPF_MAP_GET_NEXT_KEY,
-            attr
+    print(f"{len(keys)} keys in current bucket\n")
+
+    for key in keys:
+        stats_values = lookup_percpu(stats_fd, key)
+
+        # 找出各 CPU 中最新的 last_seen
+        last_seen_ns = max(
+            (value.last_seen for value in stats_values),
+            default=0
         )
 
-        # ENOENT = 這個 bucket 已經沒有 key
-        if ret is None:
-            break
-
-        # ------------------------------------------------
-        # 先確認這個 IP 是否還存在於其他 bucket
-        # ------------------------------------------------
-        still_exists = exists_in_other_buckets(
-            bucket_fd,
-            expired_idx,
-            next_key
+        # 判斷是否逾期超過 30 秒
+        expired = (
+            last_seen_ns == 0 or
+            now_ns - last_seen_ns > TIMEOUT_NS
         )
 
-        if not still_exists:
-            print(f"[EXPIRE] remove IP from stats: ")
-            print(next_key.src_ip, " -> ", next_key.dst_ip)
+        if expired:
+            print(
+                f"[EXPIRE] remove FlowKey from stats: "
+                f"src={ipaddress.IPv4Address(key.src_ip.to_bytes(4,"little"))}, "
+                f"dst={ipaddress.IPv4Address(key.dst_ip.to_bytes(4,"little"))}, "
+                f"last_seen={last_seen_ns}, "
+                f"idle={(now_ns - last_seen_ns) / 1e9:.2f}s"
+            )
 
-            delete_elem(stats_fd, next_key)
+            # 從 stats_map 刪除統計紀錄
+            delete_elem(stats_fd, key)
+            # 無論是否逾期，都刪除目前 bucket 的 key
+            delete_elem(inner_fd, key)
 
         else:
-            print(f"[KEEP] IP still exists in another bucket: ")
-            print(next_key.src_ip, " -> ", next_key.dst_ip)
+            print(
+                f"[KEEP] FlowKey still active: "
+                f"src={ipaddress.IPv4Address(key.src_ip.to_bytes(4,"little"))}, "
+                f"dst={ipaddress.IPv4Address(key.dst_ip.to_bytes(4,"little"))}, "
+                f"idle={(now_ns - last_seen_ns) / 1e9:.2f}s"
+            )
 
-        # ------------------------------------------------
-        # 最後刪除 expired bucket 裡面的 key
-        # ------------------------------------------------
-        delete_elem(inner_fd, next_key)
+
+
         
-def cleanup_buckets(stats_fd, bucket_fd):
+def cleanup_buckets(stats_fd, bucket_fd, inner_fd_list):
     now_bucket = current_bucket()
 
     expired_bucket = now_bucket - TIMEOUT_BUCKETS
@@ -374,7 +380,8 @@ def cleanup_buckets(stats_fd, bucket_fd):
 
     idx = expired_bucket % NUM_BUCKETS
 
-    inner_fd = lookup_inner_map_fd(bucket_fd, idx)
+    #inner_fd = lookup_inner_map_fd(bucket_fd, idx)
+    inner_fd = inner_fd_list[idx]
 
     if inner_fd is None:
         print(f"[ERROR] bucket {idx}: inner map not found")
@@ -394,7 +401,8 @@ def cleanup_buckets(stats_fd, bucket_fd):
         )
 
     finally:
-        os.close(inner_fd)
+        #os.close(inner_fd)
+        pass
 
 
 #=========== init inner maps ============
@@ -423,6 +431,8 @@ def update_outer(outer_fd, index, inner_fd):
     bpf_syscall(BPF_MAP_UPDATE_ELEM, attr)
 
 def init_buckets(bucket_fd):
+    inner_map_fd_list = []
+
     for i in range(NUM_BUCKETS):
         inner_fd = create_inner_map()
 
@@ -437,8 +447,9 @@ def init_buckets(bucket_fd):
         )
 
         update_outer(bucket_fd, i, inner_fd)
+        inner_map_fd_list.append(inner_fd)
 
-        os.close(inner_fd)
+    return inner_map_fd_list
 
 def struct_ip_to_u32(ip):
     packed = socket.inet_aton(ip)
@@ -488,7 +499,7 @@ def main():
     bucket_fd = get_map_fd(BUCKET_MAP_PATH)
     current_bucket_fd = get_map_fd(CURRENT_BUCKET_PATH)
 
-    init_buckets(bucket_fd)
+    inner_fd_list = init_buckets(bucket_fd)
 
     print("Start cleanup loop...")
 
@@ -496,12 +507,15 @@ def main():
         try:
             cleanup_buckets(
                 stats_fd,
-                bucket_fd
+                bucket_fd,
+                inner_fd_list
             )
 
             time.sleep(1)
 
         except KeyboardInterrupt:
+            for inner_map_file_directory in inner_fd_list:
+                os.close(inner_map_file_directory)
             break
 
 

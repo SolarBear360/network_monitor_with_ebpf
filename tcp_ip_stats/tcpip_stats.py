@@ -190,18 +190,22 @@ def iterate_keys(fd):
 
 
 def main():
-
     stats_fd = get_map_fd(STATS_MAP_PATH)
 
-    # ========================================
-    # 開啟 CSV
-    # ========================================
+    # 上一輪每個 flow 的累積數據
+    # key: bytes(key)
+    # value: (packets, bytes, syn, ack)
+    previous_flow_stats = {}
+
+    # 上一輪已完成 TCP handshake 的 flow
+    previous_established_flows = set()
+
+    # 上一輪符合 syn_only > 0 的來源 IP
+    previous_syn_ips = set()
 
     with open(CSV_FILE, "a", newline="") as csv_file:
-
         writer = csv.writer(csv_file)
 
-        # 如果是新的 CSV，寫入 header
         if csv_file.tell() == 0:
             writer.writerow([
                 "timestamp",
@@ -213,37 +217,29 @@ def main():
                 "syn_flows",
                 "established_connections"
             ])
-
             csv_file.flush()
 
-
-        # ====================================
-        # 上一次的累積值
-        # ====================================
-
-        previous_packets = 0
-        previous_bytes = 0
-        previous_syn_only = 0
-        previous_syn_ack = 0
-
+        first_iteration = True
 
         while True:
-
             # ========================================
-            # 每一秒重新統計
+            # 每一輪統計資料
             # ========================================
 
-            total_packets = 0
-            total_bytes = 0
+            interval_packets = 0
+            interval_bytes = 0
+            interval_syn_only = 0
+            interval_syn_ack = 0
 
-            syn_only_packets = 0
-            syn_ack_packets = 0
-
-            syn_source_ips = set()
+            current_syn_ips = set()
+            new_syn_source_ips = set()
             syn_flows = set()
 
             established_connections = 0
+            current_established_flows = set()
 
+            # 保存本輪所有 flow 的累積數據
+            current_flow_stats = {}
 
             # ========================================
             # 取得目前所有 flow
@@ -251,116 +247,140 @@ def main():
 
             keys = iterate_keys(stats_fd)
 
-
             for key in keys:
-
-                # ------------------------------------
-                # 取得 PERCPU value
-                # ------------------------------------
-
                 values = lookup_percpu(stats_fd, key)
 
+                if values is None:
+                    # Map 項目可能在掃描期間被刪除
+                    continue
+
                 result = aggregate(values)
-
-
-                # ====================================
-                # 1. TCP 封包數量
-                # ====================================
-
-                total_packets += result.packets
-
+                flow_key = bytes(key)
 
                 # ====================================
-                # 2. TCP bytes
+                # 1. 計算這個 flow 的累積數據差值
                 # ====================================
 
-                total_bytes += result.bytes
+                current_packets = result.packets
+                current_bytes = result.bytes
+                current_syn = result.syn
+                current_ack = result.ack
 
+                # 保存本輪累積值，供下一輪使用
+                current_flow_stats[flow_key] = (
+                    current_packets,
+                    current_bytes,
+                    current_syn,
+                    current_ack
+                )
+
+                if flow_key not in previous_flow_stats:
+                    # 新 flow：目前累積值視為本輪新增量
+                    delta_packets = current_packets
+                    delta_bytes = current_bytes
+                    delta_syn = current_syn
+                    delta_ack = current_ack
+
+                else:
+                    # 舊 flow：與同一個 flow 的上一輪數值比較
+                    prev = previous_flow_stats[flow_key]
+
+                    # 若計數器下降，視為計數器重置或 flow key 重用
+                    # 使用目前數值，避免產生負數
+                    delta_packets = (
+                        current_packets - prev[0]
+                        if current_packets >= prev[0]
+                        else current_packets
+                    )
+
+                    delta_bytes = (
+                        current_bytes - prev[1]
+                        if current_bytes >= prev[1]
+                        else current_bytes
+                    )
+
+                    delta_syn = (
+                        current_syn - prev[2]
+                        if current_syn >= prev[2]
+                        else current_syn
+                    )
+
+                    delta_ack = (
+                        current_ack - prev[3]
+                        if current_ack >= prev[3]
+                        else current_ack
+                    )
 
                 # ====================================
-                # 3. SYN=1 ACK=0
+                # 2. 累加本輪新增的封包與 bytes
                 # ====================================
 
-                syn_only = result.syn - result.ack
+                interval_packets += delta_packets
+                interval_bytes += delta_bytes
 
-                syn_only_packets += syn_only
+                # SYN-only = SYN - SYN/ACK
+                interval_syn_only += delta_syn - delta_ack
 
-
-                # ====================================
-                # 4. SYN=1 ACK=1
-                # ====================================
-
-                syn_ack_packets += result.ack
-
+                # SYN/ACK
+                interval_syn_ack += delta_ack
 
                 # ====================================
-                # 5. SYN source IP
+                # 3. 偵測本輪新出現的 SYN 來源 IP
                 # ====================================
+
+                syn_only = current_syn - current_ack
 
                 if syn_only > 0:
-
                     src_ip = key.src_ip
 
-                    syn_source_ips.add(src_ip)
+                    current_syn_ips.add(src_ip)
 
-                    # 不同 SYN flow
-                    syn_flows.add(bytes(key))
-
+                    if src_ip not in previous_syn_ips:
+                        new_syn_source_ips.add(src_ip)
+                        syn_flows.add(flow_key)
 
                 # ====================================
-                # 6. Established
+                # 4. 偵測本輪新觀察到的已完成連線
                 # ====================================
 
                 if result.connection_state == TCP_STATE_ESTABLISHED:
-                    established_connections += 1
+                    current_established_flows.add(flow_key)
 
-
-            # ========================================
-            # 計算「這一秒」增加多少
-            # ========================================
-
-            interval_packets = total_packets - previous_packets
-            interval_bytes = total_bytes - previous_bytes
-
-            interval_syn_only = syn_only_packets - previous_syn_only
-            interval_syn_ack = syn_ack_packets - previous_syn_ack
-
+                    if flow_key not in previous_established_flows:
+                        established_connections += 1
 
             # ========================================
-            # 第一次執行
-            #
-            # 如果不想讓第一次包含程式啟動前
-            # 已經存在的封包，可以設定為 0。
+            # 5. 第一次執行時的處理
             # ========================================
 
-            if previous_packets == 0:
-                interval_packets = total_packets
-                interval_bytes = total_bytes
-                interval_syn_only = syn_only_packets
-                interval_syn_ack = syn_ack_packets
-
+            # 第一次掃描時，所有仍在 Map 中的累積值
+            # 都會被視為本輪數據。
+            first_iteration = False
 
             # ========================================
-            # 更新 previous
+            # 6. 更新歷史資料
             # ========================================
 
-            previous_packets = total_packets
-            previous_bytes = total_bytes
-            previous_syn_only = syn_only_packets
-            previous_syn_ack = syn_ack_packets
+            # 用本輪快照取代上一輪快照。
+            # 已從 Map 消失的 flow 不會保留在字典中。
+            previous_flow_stats = current_flow_stats
 
+            previous_syn_ips = current_syn_ips
+
+            previous_established_flows = (
+                current_established_flows
+            )
 
             # ========================================
-            # 時間
+            # 7. 時間
             # ========================================
 
             timestamp = datetime.now().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
 
-
             # ========================================
-            # 終端輸出
+            # 8. 終端輸出
             # ========================================
 
             print("----------------------------------------")
@@ -368,13 +388,12 @@ def main():
             print(f"TCP bytes                       : {interval_bytes}")
             print(f"SYN=1 ACK=0 封包數量            : {interval_syn_only}")
             print(f"SYN=1 ACK=1 封包數量            : {interval_syn_ack}")
-            print(f"SYN來源 IP 數量                  : {len(syn_source_ips)}")
-            print(f"SYN 不同 Flow 數量               : {len(syn_flows)}")
-            print(f"完成 TCP handshake 連線數        : {established_connections}")
-
+            print(f"本輪新 SYN 來源 IP 數量          : {len(new_syn_source_ips)}")
+            print(f"本輪新 SYN Flow 數量             : {len(syn_flows)}")
+            print(f"本輪新觀察到的完成連線數          : {established_connections}")
 
             # ========================================
-            # 寫入 CSV
+            # 9. 寫入 CSV
             # ========================================
 
             writer.writerow([
@@ -383,18 +402,12 @@ def main():
                 interval_bytes,
                 interval_syn_only,
                 interval_syn_ack,
-                len(syn_source_ips),
+                len(new_syn_source_ips),
                 len(syn_flows),
                 established_connections
             ])
 
-            # 立即寫入檔案
             csv_file.flush()
-
-
-            # ========================================
-            # 每秒更新
-            # ========================================
 
             time.sleep(1)
 
