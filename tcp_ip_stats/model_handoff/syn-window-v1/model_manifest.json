@@ -1,0 +1,29 @@
+{
+  "package_name": "syn-window-v1",
+  "status": "experimental_prototype",
+  "model_file": "model.joblib",
+  "model_sha256": "0cf4c78dc2e92366e604045c30a87fac0c039dccb169ad6f128b9aa6e04dffcd",
+  "runtime_model_file": "runtime_model.json",
+  "runtime_model_sha256": "19a276bb2fb6aaad7aa09c70f2cea6529fb51c7b72f4373fbf2d3c38320bb505",
+  "model_type": "logistic_regression",
+  "window_seconds": 1,
+  "raw_inputs": [
+    "tcp_packets",
+    "tcp_bytes",
+    "syn_only_packets"
+  ],
+  "derived_inputs": [
+    "syn_ratio"
+  ],
+  "model_probability_threshold": 0.5,
+  "provisional_minimum_syn": 5,
+  "training_rows": 1443,
+  "training_run_ids": [
+    "comprehensive_20261108_145857",
+    "comprehensive_20261108_222636"
+  ],
+  "evaluation_mode": "leave_one_run_out",
+  "attack_precision": 1.0,
+  "attack_recall": 0.8965014577259475,
+  "production_ready": false
+}

@@ -2,6 +2,17 @@
 
 此專案透過ebpf(tc)來檢測封包，並記錄到bpf map中。再由python讀取bpf map以便做流量分析。
 
+## TCP 統計、SYN Flood 即時模型與測試
+
+`tcp_ip_stats/` 包含每秒 TCP 統計、SYN Flood 即時偵測模型，以及在隔離 Docker 網路內執行的 final holdout 測試。
+
+- [環境準備、啟動方式與目前限制](tcp_ip_stats/README.md)
+- [最新隔離式測試完整操作手冊](tcp_ip_stats/traffic_test/FINAL_HOLDOUT_USAGE.md)
+- [模型套件](tcp_ip_stats/model_handoff/syn-window-v1/README.md)
+- [模型訓練與評估工具](tcp_ip_stats/ml_test/README.md)
+
+以下保留原本 `network_monitor/` 的基本封包監測說明；其腳本請在該目錄執行。
+
 ## 如何使用
 此專案有三個檔案 :
 - network_flow_detect_init.sh
