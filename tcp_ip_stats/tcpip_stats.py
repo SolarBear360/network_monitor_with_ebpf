@@ -213,7 +213,7 @@ def main():
                 "tcp_bytes",
                 "syn_only_packets",
                 "syn_ack_packets",
-                "syn_source_ips",
+                "active_source_ips",
                 "syn_flows",
                 "established_connections"
             ])
@@ -230,6 +230,8 @@ def main():
             interval_bytes = 0
             interval_syn_only = 0
             interval_syn_ack = 0
+
+            current_active_ips = set()
 
             current_syn_ips = set()
             new_syn_source_ips = set()
@@ -256,6 +258,17 @@ def main():
 
                 result = aggregate(values)
                 flow_key = bytes(key)
+
+                # ====================================
+                # 判斷此 flow 是否在本輪有傳送封包
+                # ====================================
+
+                current_time_ns = time.monotonic_ns()
+
+                # 假設 last_seen 使用 bpf_ktime_get_ns()
+                if result.last_seen > 0:
+                    if current_time_ns - result.last_seen < 1_000_000_000:
+                        current_active_ips.add(key.src_ip)
 
                 # ====================================
                 # 1. 計算這個 flow 的累積數據差值
@@ -388,7 +401,7 @@ def main():
             print(f"TCP bytes                       : {interval_bytes}")
             print(f"SYN=1 ACK=0 封包數量            : {interval_syn_only}")
             print(f"SYN=1 ACK=1 封包數量            : {interval_syn_ack}")
-            print(f"本輪新 SYN 來源 IP 數量          : {len(new_syn_source_ips)}")
+            print(f"本輪活動來源 IP 數量             : {len(current_active_ips)}")
             print(f"本輪新 SYN Flow 數量             : {len(syn_flows)}")
             print(f"本輪新觀察到的完成連線數          : {established_connections}")
 
@@ -402,7 +415,7 @@ def main():
                 interval_bytes,
                 interval_syn_only,
                 interval_syn_ack,
-                len(new_syn_source_ips),
+                len(current_active_ips),
                 len(syn_flows),
                 established_connections
             ])
