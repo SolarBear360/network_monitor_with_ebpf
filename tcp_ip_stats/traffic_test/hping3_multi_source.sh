@@ -14,6 +14,7 @@ set -Eeuo pipefail
 HPING_SOURCE_IPS="${HPING_SOURCE_IPS:-}"
 HPING_RAND_SOURCE="${HPING_RAND_SOURCE:-0}"
 HPING_ISOLATED_LAB="${HPING_ISOLATED_LAB:-0}"
+HPING_BIN="${HPING_BIN:-hping3}"
 
 is_uint() {
     [[ "$1" =~ ^[0-9]+$ ]]
@@ -75,12 +76,12 @@ run_one_source() {
 
     if [[ -n "$source_ip" ]]; then
         timeout --foreground --signal=TERM --kill-after=5s "${guard_seconds}s" \
-            hping3 --syn --numeric --quiet --spoof "$source_ip" \
+            "$HPING_BIN" --syn --numeric --quiet --spoof "$source_ip" \
             --destport "$HPING_PORT" --interval "$interval" \
             --count "$count" "$HPING_TARGET"
     else
         timeout --foreground --signal=TERM --kill-after=5s "${guard_seconds}s" \
-            hping3 --syn --numeric --quiet \
+            "$HPING_BIN" --syn --numeric --quiet \
             --destport "$HPING_PORT" --interval "$interval" \
             --count "$count" "$HPING_TARGET"
     fi
@@ -99,11 +100,42 @@ if [[ "$HPING_RAND_SOURCE" == "1" ]]; then
     count=$((HPING_RATE * HPING_DURATION))
     guard_seconds=$((HPING_DURATION + 15))
     echo "hping3 rand-source: target=${HPING_TARGET}:${HPING_PORT}, rate=${HPING_RATE}pps, duration=${HPING_DURATION}s"
-    timeout --foreground --signal=TERM --kill-after=5s "${guard_seconds}s" \
-        hping3 --syn --numeric --quiet --rand-source \
-        --destport "$HPING_PORT" --interval "$interval" \
-        --count "$count" "$HPING_TARGET"
-    exit 0
+    if output="$(
+        LC_ALL=C timeout --foreground --signal=TERM --kill-after=5s "${guard_seconds}s" \
+            "$HPING_BIN" --syn --numeric --quiet --rand-source \
+            --destport "$HPING_PORT" --interval "$interval" \
+            --count "$count" "$HPING_TARGET" 2>&1
+    )"; then
+        status=0
+    else
+        status=$?
+    fi
+    printf '%s\n' "$output"
+
+    # Spoofed SYN-ACK replies are routed to the random source IPs, not back to
+    # this container. hping3 can therefore exit 1 for 100% packet loss even
+    # after sending every requested SYN. Require a complete transmission
+    # summary before normalizing that expected status to success.
+    transmitted=""
+    while IFS= read -r summary_line; do
+        summary_line="${summary_line%$'\r'}"
+        if [[ "$summary_line" =~ ^([0-9]+)[[:space:]]+packets[[:space:]]+transmitted, ]]; then
+            transmitted="${BASH_REMATCH[1]}"
+        fi
+    done <<< "$output"
+
+    if [[ "$transmitted" == "$count" ]] && ((status == 0 || status == 1)); then
+        if ((status == 1)); then
+            echo "hping3 rand-source: all ${count} packets transmitted; no replies are expected for spoofed sources."
+        fi
+        exit 0
+    fi
+
+    if ((status == 0)); then
+        status=1
+    fi
+    echo "hping3 rand-source failed: status=${status}, transmitted=${transmitted:-unknown}, expected=${count}" >&2
+    exit "$status"
 fi
 
 if [[ "$HPING_RAND_SOURCE" != "0" ]]; then

@@ -93,6 +93,7 @@ sudo python3 tcpip_stats.py
 ```bash
 python3 -m unittest -v test_syn_flood_runtime
 bash -n init.sh traffic_test/create_isolated_synlab.sh traffic_test/run_final_holdout_experiment.sh traffic_test/hping3_multi_source.sh
+./traffic_test/test_hping3_multi_source.sh
 ./traffic_test/run_final_holdout_experiment.sh --dry-run
 ```
 

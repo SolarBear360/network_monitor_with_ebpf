@@ -8,6 +8,7 @@
 - `run_final_holdout_experiment.sh`：完整實驗、標籤合併與模型評估。
 - `normal_tcp_connections.py`、`normal_http_keepalive.py`：正常 HTTP 流量。
 - `hping3_multi_source.sh`、`hping3.Dockerfile`：主腳本使用的 hping3 工具。
+- `test_hping3_multi_source.sh`：不發送流量，測試 hping3 結束狀態判斷。
 - `merge_labels.py`：按實際情境時間合併標籤。
 
 舊 Mac／Nping／k6 流程不在本分支的交付範圍。`results/` 由執行時產生，Git 會忽略其中的資料。
