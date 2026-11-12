@@ -1,122 +1,271 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# 預設值（如果使用者沒有指定參數，就會使用這些預設值）
-TC_PROG="tc_log.c"
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+TC_PROG="$SCRIPT_DIR/tc_tcpip_stats.c"
 CONTAINER_NAME="ebpf-test-container"
+DOCKER_CONTEXT="default"
+SHOW_TRACE=0
 
-# Help 說明函式
+PIN_ROOT="/sys/fs/bpf"
+PYTHON_PIN_DIR="$PIN_ROOT/ip/globals"
+MAP_NAMES=(
+    tcp_flow_map
+    tcp_bucket_maps
+    tcp_current_bucket
+    target_ip_map
+)
+
+HOST_INTERFACE=""
+ATTACHED=0
+
 show_help() {
-    echo "使用說明:"
-    echo "  $0 [選項]"
-    echo ""
-    echo "選項:"
-    echo "  -t, --tc-prog <file.c>       指定要編譯與掛載的 eBPF C 語言原始碼檔案 (預設: tc_log.c)"
-    echo "  -c, --container <name>       指定要監測的 Docker 容器名稱或 ID (預設: ebpf-test-container)"
-    echo "  -h, --help                   顯示此說明訊息"
-    echo ""
-    echo "範例:"
-    echo "  $0 --tc-prog my_filter.c --container web_server"
-    exit 0
+    cat <<EOF
+使用方式：
+  ./init.sh [選項]
+
+選項：
+  -t, --tc-prog FILE.c       eBPF 原始碼（預設：tc_tcpip_stats.c）
+  -c, --container NAME       要監測的 Docker 容器（預設：ebpf-test-container）
+      --docker-context NAME  Docker context（預設：default）
+      --trace                顯示 bpf_printk 訊息；會明顯增加輸出量
+  -h, --help                 顯示說明
+
+範例：
+  ./init.sh
+  ./init.sh --container ebpf-web-test
+  ./init.sh --container ebpf-web-test --trace
+EOF
 }
 
-# 解析參數 (支援 -t/--tc-prog, -c/--container, -h/--help)
+require_value() {
+    if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "錯誤：$1 後面需要一個值。" >&2
+        exit 2
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
-    case $1 in
+    case "$1" in
         -t|--tc-prog)
+            require_value "$@"
             TC_PROG="$2"
             shift 2
             ;;
         -c|--container)
+            require_value "$@"
             CONTAINER_NAME="$2"
             shift 2
             ;;
+        --docker-context)
+            require_value "$@"
+            DOCKER_CONTEXT="$2"
+            shift 2
+            ;;
+        --trace)
+            SHOW_TRACE=1
+            shift
+            ;;
         -h|--help)
             show_help
+            exit 0
             ;;
         *)
-            echo "錯誤: 未知的參數 $1"
-            show_help
+            echo "錯誤：未知參數 $1" >&2
+            show_help >&2
+            exit 2
             ;;
     esac
 done
 
-# 自動將 .c 結尾替換成 .o 作為編譯輸出名稱
+if [[ "$TC_PROG" != /* ]]; then
+    TC_PROG="$SCRIPT_DIR/$TC_PROG"
+fi
+
+if [[ ! -f "$TC_PROG" ]]; then
+    echo "錯誤：找不到 eBPF 原始碼：$TC_PROG" >&2
+    exit 1
+fi
+
 OBJ_FILE="${TC_PROG%.c}.o"
 
-echo "=== 開始執行 eBPF/TC 監控腳本 ==="
-echo "目標程式: $TC_PROG (編譯輸出: $OBJ_FILE)"
-echo "目標容器: $CONTAINER_NAME"
-echo "--------------------------------"
-
-# 1. 編譯 eBPF 程式 (加上 -g 以防 BTF 遺失錯誤)
-echo "[1/6] 正在編譯 eBPF 程式..."
-
-#clang -g -O2 -target bpf -c "$TC_PROG" -o "$OBJ_FILE"
-clang -g -O2 -target bpf \
-  -I. \
-  -c "$TC_PROG" -o "$OBJ_FILE"
-  
-if [ $? -ne 0 ]; then
-    echo "錯誤: 編譯失敗，請檢查 $TC_PROG 是否存在或語法正確。"
-    exit 1
-fi
-
-# 2. 獲取 Docker 在主機端對應的網路介面索引值
-echo "[2/6] 正在獲取容器網路介面..."
-IFINDEX=$(sudo docker exec "$CONTAINER_NAME" cat /sys/class/net/eth0/iflink 2>/dev/null | tr -d '\r')
-
-if [ -z "$IFINDEX" ]; then
-    echo "錯誤: 找不到容器 '$CONTAINER_NAME' 或無法讀取網路介面。請確認容器是否正在執行。"
-    exit 1
-fi
-
-# 3. 找出主機端對應的 veth 網卡名稱
-HOST_INTERFACE=$(ip link | grep "^${IFINDEX}:" | cut -d' ' -f2 | cut -d'@' -f1)
-echo "找到主機對應網卡: $HOST_INTERFACE"
-
-# ========================================================
-# 修正後的步驟：強力清理所有可能殘留的舊 Map 檔案與目錄
-# ========================================================
-echo "[3.5] 正在清理舊的 Pinned Map 檔案以利重建..."
-
-# 1. 定義所有可能出現 pkt_stats_map 的路徑
-MAP_PATHS=(
-    "/sys/fs/bpf/ip/globals/tcp_flow_map"
-    "/sys/fs/bpf/ip/globals/tcp_bucket_maps"
-    "/sys/fs/bpf/ip/globals/tcp_current_bucket"
-)
-echo "DEBUG in networkflow_detect_init.sh ${MAP_PATHS[@]}"
-# 2. 循環檢查並強制刪除
-for PATH_TO_CHECK in "${MAP_PATHS[@]}"; do
-    echo "DEBUG in networkflow_detect_init.sh : PATH_TO_CHECK = ${PATH_TO_CHECK}"
-    if [ -f "$PATH_TO_CHECK" ]; then
-        echo "偵測到舊的 Map，正在強制移除: $PATH_TO_CHECK"
-        sudo rm -f "$PATH_TO_CHECK"
-    fi 
+for command_name in clang docker ip tc bpftool mountpoint mount python3 awk; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "錯誤：找不到必要指令 '$command_name'。" >&2
+        exit 1
+    fi
 done
-# ========================================================
 
-# 4. 建立 clsact 佇列與掛載 eBPF 程式
-echo "[3/6] 正在建立 clsact qdisc..."
-sudo tc qdisc add dev "$HOST_INTERFACE" clsact 2>/dev/null || echo "clsact 已存在，跳過建立。"
+echo "[1/7] 編譯 eBPF 程式..."
+CLANG_FLAGS=(-g -O2 -target bpf -I"$SCRIPT_DIR")
+if [[ $SHOW_TRACE -eq 1 ]]; then
+    CLANG_FLAGS+=(-DENABLE_TRACE=1)
+fi
+clang "${CLANG_FLAGS[@]}" -c "$TC_PROG" -o "$OBJ_FILE"
 
-echo "[4/6] 正在掛載 Ingress 與 Egress 過濾器..."
-sudo tc filter add dev "$HOST_INTERFACE" ingress bpf da obj "$OBJ_FILE" sec tc
-sudo tc filter add dev "$HOST_INTERFACE" egress bpf da obj "$OBJ_FILE" sec tc
-#sudo tc filter add dev $HOST_INTERFACE ingress bpf da obj "$OBJ_FILE" sec tc_ingress
-#sudo tc filter add dev $HOST_INTERFACE egress bpf da obj "$OBJ_FILE" sec tc_egress
-
-# 5. 掛載 BPF 檔案系統 (避免 Map pinning 失敗)
-echo "[5/6] 檢查並掛載 BPF 檔案系統..."
-if ! mountpoint -q /sys/fs/bpf; then
-    sudo mount -t bpf bpf /sys/fs/bpf/
+if [[ $EUID -eq 0 ]]; then
+    PRIVILEGED=()
+else
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "錯誤：掛載 eBPF 需要 root 權限，但系統沒有 sudo。" >&2
+        exit 1
+    fi
+    echo "接下來需要 sudo 權限來操作 Docker、TC 與 BPF map。"
+    sudo -v
+    PRIVILEGED=(sudo)
 fi
 
-# 6. 開始監聽日誌
-echo "[6/6] 開始監聽核心核心日誌 (按下 Ctrl+C 結束監聽並卸載)..."
-echo "=========================================================="
+remove_map_pins() {
+    local map_name
 
-# 利用 trap 機制，確保使用者按下 Ctrl+C 結束時，一定會執行清理網卡的動作
-trap 'echo ""; echo "正在卸載 eBPF 程式並清理網卡..."; sudo tc qdisc del dev "$HOST_INTERFACE" clsact; exit 0' INT
+    for map_name in "${MAP_NAMES[@]}"; do
+        "${PRIVILEGED[@]}" rm -f -- \
+            "$PIN_ROOT/$map_name" \
+            "$PIN_ROOT/tc/globals/$map_name" \
+            "$PYTHON_PIN_DIR/$map_name" 2>/dev/null || true
+    done
+}
 
-sudo cat /sys/kernel/debug/tracing/trace_pipe
+cleanup() {
+    local exit_code=$?
+    trap - EXIT INT TERM HUP
+
+    if [[ $ATTACHED -eq 1 && -n "$HOST_INTERFACE" ]]; then
+        echo
+        echo "正在卸載 $HOST_INTERFACE 上的 TC/eBPF 程式..."
+        "${PRIVILEGED[@]}" tc qdisc del dev "$HOST_INTERFACE" clsact 2>/dev/null || true
+        remove_map_pins
+    fi
+
+    exit "$exit_code"
+}
+trap cleanup EXIT INT TERM HUP
+
+echo "[2/7] 檢查 bpffs..."
+if ! mountpoint -q "$PIN_ROOT"; then
+    "${PRIVILEGED[@]}" mount -t bpf bpf "$PIN_ROOT"
+fi
+
+echo "[3/7] 檢查 Docker 與目標容器..."
+if ! "${PRIVILEGED[@]}" docker --context "$DOCKER_CONTEXT" info >/dev/null 2>&1; then
+    echo "錯誤：無法連線到 Docker context '$DOCKER_CONTEXT'。" >&2
+    echo "若使用原生 Docker，可先執行：sudo systemctl start docker" >&2
+    exit 1
+fi
+
+if [[ "$("${PRIVILEGED[@]}" docker --context "$DOCKER_CONTEXT" inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)" != "true" ]]; then
+    echo "錯誤：容器 '$CONTAINER_NAME' 不存在或尚未執行。" >&2
+    echo "可使用以下指令查看：sudo docker --context $DOCKER_CONTEXT ps -a" >&2
+    exit 1
+fi
+
+echo "[4/7] 尋找 Container 對應的主機 veth..."
+IFINDEX="$("${PRIVILEGED[@]}" docker --context "$DOCKER_CONTEXT" exec "$CONTAINER_NAME" cat /sys/class/net/eth0/iflink | tr -d '\r\n')"
+HOST_INTERFACE="$(ip -o link show | awk -F': ' -v if_idx="$IFINDEX" '$1 == if_idx {split($2, names, "@"); print names[1]; exit}')"
+
+if [[ -z "$HOST_INTERFACE" ]]; then
+    echo "錯誤：找不到 ifindex=$IFINDEX 對應的主機 veth。" >&2
+    exit 1
+fi
+
+CONTAINER_IP="$(
+    "${PRIVILEGED[@]}" docker --context "$DOCKER_CONTEXT" inspect \
+        -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' \
+        "$CONTAINER_NAME" | awk '{print $1}'
+)"
+
+if [[ -z "$CONTAINER_IP" ]]; then
+    echo "錯誤：無法取得容器 '$CONTAINER_NAME' 的 IPv4 位址。" >&2
+    exit 1
+fi
+
+echo "容器：$CONTAINER_NAME ($CONTAINER_IP)"
+echo "主機 veth：$HOST_INTERFACE"
+
+echo "[5/7] 清除本程式先前留下的掛載與 map..."
+# 此腳本假設目標 veth 是專題測試 Container 專用；重建 clsact 可避免 filter 重複累積。
+"${PRIVILEGED[@]}" tc qdisc del dev "$HOST_INTERFACE" clsact 2>/dev/null || true
+remove_map_pins
+"${PRIVILEGED[@]}" tc qdisc add dev "$HOST_INTERFACE" clsact
+ATTACHED=1
+
+echo "[6/7] 掛載 ingress 與 egress TC filter..."
+"${PRIVILEGED[@]}" tc filter add dev "$HOST_INTERFACE" ingress \
+    pref 10 handle 1 bpf da obj "$OBJ_FILE" sec tc
+"${PRIVILEGED[@]}" tc filter add dev "$HOST_INTERFACE" egress \
+    pref 10 handle 1 bpf da obj "$OBJ_FILE" sec tc
+
+# Python 程式仍使用 /sys/fs/bpf/ip/globals/*。如果 libbpf 將 map pin 在
+# /sys/fs/bpf/* 或 /sys/fs/bpf/tc/globals/*，就在舊路徑增加另一個 pin。
+echo "[7/7] 準備 Python 程式使用的 pinned map 路徑..."
+"${PRIVILEGED[@]}" mkdir -p -- "$PYTHON_PIN_DIR"
+
+for map_name in "${MAP_NAMES[@]}"; do
+    expected_path="$PYTHON_PIN_DIR/$map_name"
+
+    if "${PRIVILEGED[@]}" test -e "$expected_path"; then
+        continue
+    fi
+
+    source_path=""
+    for candidate in "$PIN_ROOT/$map_name" "$PIN_ROOT/tc/globals/$map_name"; do
+        if "${PRIVILEGED[@]}" test -e "$candidate"; then
+            source_path="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$source_path" ]]; then
+        echo "錯誤：eBPF 已掛載，但找不到 map '$map_name' 的 pinned path。" >&2
+        exit 1
+    fi
+
+    "${PRIVILEGED[@]}" bpftool map pin pinned "$source_path" "$expected_path"
+done
+
+# 先由 init.sh 寫入目標 IPv4，避免等待清理程式啟動期間把 Container
+# 發出的封包也混進「收到的封包」統計。tcpip_pakage_expire.py 之後會再寫一次相同值。
+IFS=. read -r ip_octet_1 ip_octet_2 ip_octet_3 ip_octet_4 <<< "$CONTAINER_IP"
+"${PRIVILEGED[@]}" bpftool map update pinned "$PYTHON_PIN_DIR/target_ip_map" \
+    key hex 00 00 00 00 \
+    value hex \
+    "$(printf '%02x' "$ip_octet_1")" \
+    "$(printf '%02x' "$ip_octet_2")" \
+    "$(printf '%02x' "$ip_octet_3")" \
+    "$(printf '%02x' "$ip_octet_4")"
+
+echo
+echo "eBPF 已掛載完成。請保留這個終端執行。"
+echo "在第二個終端啟動 bucket／過期清理："
+echo "  cd \"$SCRIPT_DIR\""
+echo "  sudo python3 tcpip_pakage_expire.py \"$CONTAINER_IP\""
+echo
+echo "在第三個終端輸出統計與 CSV："
+echo "  cd \"$SCRIPT_DIR\""
+echo "  sudo python3 tcpip_stats.py"
+echo "  # 模型結果會同時寫入 syn_flood_predictions.csv"
+echo
+echo "按 Ctrl+C 會卸載本腳本掛上的 TC filter 與 map。"
+
+if [[ $SHOW_TRACE -eq 1 ]]; then
+    TRACE_PIPE=""
+    for candidate in /sys/kernel/tracing/trace_pipe /sys/kernel/debug/tracing/trace_pipe; do
+        if "${PRIVILEGED[@]}" test -e "$candidate"; then
+            TRACE_PIPE="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$TRACE_PIPE" ]]; then
+        echo "錯誤：找不到 trace_pipe；改為安靜等待。" >&2
+    else
+        "${PRIVILEGED[@]}" cat "$TRACE_PIPE"
+        exit 0
+    fi
+fi
+
+while true; do
+    sleep 3600 &
+    wait $!
+done

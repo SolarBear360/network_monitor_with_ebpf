@@ -1,0 +1,36 @@
+# Local credentials and editor/OS metadata
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
+._*
+*.swp
+*.swo
+
+# Python environments/cache and compiled eBPF objects
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.o
+
+# Captures, archives, generated statistics and per-run logs
+*.pcap
+*.pcapng
+*.zip
+*.tar.gz
+*.log
+*.csv
+!model_handoff/syn-window-v1/example_input.csv
+/traffic_test/results/
+/traffic_test/comprehensive_*/
+/ml_test/output*/
+/ml_test/external_pcap_evaluation*/
+/ml_test/comprehensive_policy_evaluation*/
+/ml_test/low_rate_boundary_analysis*/
+/ml_test/cic_proxy_training*/
+/model_handoff/syn-window-v1 (2)/
+
+# vmlinux.h and the small frozen model.joblib are intentionally versioned.

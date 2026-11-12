@@ -1,0 +1,43 @@
+{
+  "package_name": "syn-window-v1",
+  "source_model_sha256": "0cf4c78dc2e92366e604045c30a87fac0c039dccb169ad6f128b9aa6e04dffcd",
+  "model_type": "standard_scaler_logistic_regression",
+  "features": [
+    "tcp_packets",
+    "tcp_bytes",
+    "syn_only_packets",
+    "syn_ratio"
+  ],
+  "imputer_median": [
+    60.0,
+    4950.0,
+    26.0,
+    0.23661485319516407
+  ],
+  "scaler_mean": [
+    130.2044352044352,
+    9327.377685377685,
+    45.866250866250866,
+    0.41511358458587116
+  ],
+  "scaler_scale": [
+    159.24622490548754,
+    12081.230730262494,
+    60.34149288245091,
+    0.3759462266823817
+  ],
+  "coefficient": [
+    1.2649885331810964,
+    -2.2831414864237733,
+    9.216990493724554,
+    2.419749352836999
+  ],
+  "intercept": 3.7167736525826287,
+  "probability_threshold": 0.5,
+  "minimum_syn_packets": 5,
+  "persistence_window_seconds": 3,
+  "persistence_required_hits": 2,
+  "clear_after_normal_seconds": 3,
+  "minimum_valid_window_seconds": 0.8,
+  "maximum_valid_window_seconds": 1.2
+}
