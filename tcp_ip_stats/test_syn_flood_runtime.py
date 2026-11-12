@@ -5,10 +5,21 @@ import json
 from pathlib import Path
 
 from syn_flood_runtime import LogisticRuntimeModel, SynFloodDetector
+from tcpip_stats import DEFAULT_RUNTIME_MODEL
 
 
 ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "model_handoff" / "syn-window-v1" / "runtime_model.json"
+MODEL_PATH = (
+    ROOT / "model_handoff" / "syn-window-full6-v1" / "runtime_model.json"
+)
+FULL6_FEATURES = [
+    "tcp_packets",
+    "tcp_bytes",
+    "syn_only_packets",
+    "syn_ratio",
+    "active_source_ips",
+    "established_connections",
+]
 
 
 class SynFloodRuntimeTests(unittest.TestCase):
@@ -53,14 +64,14 @@ class SynFloodRuntimeTests(unittest.TestCase):
             self.assertGreaterEqual(probability, 0.0)
             self.assertLessEqual(probability, 1.0)
 
+    def test_project_default_is_the_full_six_feature_model(self):
+        model = LogisticRuntimeModel.load(DEFAULT_RUNTIME_MODEL)
+        self.assertEqual(DEFAULT_RUNTIME_MODEL, MODEL_PATH)
+        self.assertEqual(model.features, FULL6_FEATURES)
+        self.assertEqual(model.config["package_name"], "syn-window-full6-v1")
+
     def test_established_connections_feature_can_be_used(self):
-        config = json.loads(MODEL_PATH.read_text(encoding="utf-8"))
-        config["features"].append("established_connections")
-        config["imputer_median"].append(0.0)
-        config["scaler_mean"].append(0.0)
-        config["scaler_scale"].append(1.0)
-        config["coefficient"].append(-1.0)
-        model = LogisticRuntimeModel(config)
+        model = LogisticRuntimeModel.load(MODEL_PATH)
 
         without_handshake = model.predict_probability(100, 8000, 35, 0)
         with_handshake = model.predict_probability(100, 8000, 35, 10)
@@ -68,13 +79,7 @@ class SynFloodRuntimeTests(unittest.TestCase):
         self.assertLess(with_handshake, without_handshake)
 
     def test_active_source_ips_feature_can_be_used(self):
-        config = json.loads(MODEL_PATH.read_text(encoding="utf-8"))
-        config["features"].append("active_source_ips")
-        config["imputer_median"].append(0.0)
-        config["scaler_mean"].append(0.0)
-        config["scaler_scale"].append(1.0)
-        config["coefficient"].append(1.0)
-        model = LogisticRuntimeModel(config)
+        model = LogisticRuntimeModel.load(MODEL_PATH)
 
         one_source = model.predict_probability(
             100, 8000, 35, active_source_ips=1

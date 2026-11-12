@@ -1,0 +1,53 @@
+{
+  "package_name": "syn-window-full6-v1",
+  "source_model_sha256": "d6909128290941f1bcccd456a2e6f9aaa46d041b5b715f20928d08d9fa8338e7",
+  "model_type": "standard_scaler_logistic_regression",
+  "features": [
+    "tcp_packets",
+    "tcp_bytes",
+    "syn_only_packets",
+    "syn_ratio",
+    "active_source_ips",
+    "established_connections"
+  ],
+  "imputer_median": [
+    148.0,
+    8952.0,
+    36.0,
+    0.30303030303030304,
+    2.0,
+    0.0
+  ],
+  "scaler_mean": [
+    217.09094229364499,
+    17250.433893352812,
+    65.97954711468225,
+    0.39429371082621417,
+    30.388604821037255,
+    1.2720964207450693
+  ],
+  "scaler_scale": [
+    220.33495680535944,
+    18498.1134748589,
+    65.7676501308917,
+    0.3183109204462139,
+    56.275438284857614,
+    6.102014664687292
+  ],
+  "coefficient": [
+    -7.601181081650198,
+    4.319317413021445,
+    7.6201960172817635,
+    1.461281262980277,
+    2.5848082358638047,
+    -1.919180595179063
+  ],
+  "intercept": 3.6098362849755197,
+  "probability_threshold": 0.5,
+  "minimum_syn_packets": 5,
+  "persistence_window_seconds": 3,
+  "persistence_required_hits": 2,
+  "clear_after_normal_seconds": 3,
+  "minimum_valid_window_seconds": 0.8,
+  "maximum_valid_window_seconds": 1.2
+}

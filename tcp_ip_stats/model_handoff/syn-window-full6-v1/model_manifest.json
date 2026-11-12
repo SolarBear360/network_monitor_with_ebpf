@@ -1,0 +1,70 @@
+{
+  "package_name": "syn-window-full6-v1",
+  "source_experiment_name": "full_6",
+  "status": "current_final_for_project",
+  "model_file": "model.joblib",
+  "model_sha256": "d6909128290941f1bcccd456a2e6f9aaa46d041b5b715f20928d08d9fa8338e7",
+  "runtime_model_file": "runtime_model.json",
+  "runtime_model_sha256": "e7d584f7b5de4150b4acb5da370aeced86c9d3b9bbad8eb67b17db3b8ad2d009",
+  "model_type": "standard_scaler_logistic_regression",
+  "window_seconds": 1,
+  "raw_inputs": [
+    "tcp_packets",
+    "tcp_bytes",
+    "syn_only_packets",
+    "active_source_ips",
+    "established_connections"
+  ],
+  "derived_inputs": [
+    "syn_ratio"
+  ],
+  "model_features_in_order": [
+    "tcp_packets",
+    "tcp_bytes",
+    "syn_only_packets",
+    "syn_ratio",
+    "active_source_ips",
+    "established_connections"
+  ],
+  "model_probability_threshold": 0.5,
+  "minimum_syn_packets": 5,
+  "persistence_window_seconds": 3,
+  "persistence_required_hits": 2,
+  "clear_after_normal_seconds": 3,
+  "minimum_valid_window_seconds": 0.8,
+  "maximum_valid_window_seconds": 1.2,
+  "training_rows": 2738,
+  "training_run_ids": [
+    "training_capture_20261111_195615"
+  ],
+  "local_final_holdout_runtime_policy": {
+    "rows": 2737,
+    "accuracy": 0.9265619291194739,
+    "attack_precision": 0.9850746268656716,
+    "attack_recall": 0.8902513795217658,
+    "attack_f1": 0.9352657004830918,
+    "confusion_matrix": {
+      "tn": 1084,
+      "fp": 22,
+      "fn": 179,
+      "tp": 1452
+    },
+    "detected_attack_scenarios": 15,
+    "attack_scenarios": 16
+  },
+  "external_cicddos2019_official_window_runtime_policy": {
+    "accuracy": 0.9796,
+    "balanced_accuracy": 0.9215,
+    "attack_precision": 0.7764,
+    "attack_recall": 0.8567,
+    "attack_f1": 0.8146,
+    "false_positives": 74,
+    "false_negatives": 43
+  },
+  "production_ready": false,
+  "limitations": [
+    "Training data contains one experiment run, so the model is still an experimental project final version.",
+    "Spoofed multi-source traffic was generated from one host and is not equivalent to independent physical attackers.",
+    "Labels describe configured traffic scenarios, not proven service exhaustion."
+  ]
+}
