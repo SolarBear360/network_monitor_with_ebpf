@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Generate bounded normal HTTP keep-alive traffic without k6."""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import ipaddress
+import json
+import random
+import statistics
+import threading
+import time
+
+
+ALLOWED_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in (
+        "10.0.0.0/8",
+        "127.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "100.64.0.0/10",
+    )
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", type=int, default=80)
+    parser.add_argument("--vus", required=True, type=int)
+    parser.add_argument("--duration", required=True, type=int)
+    parser.add_argument("--timeout", type=float, default=3.0)
+    parser.add_argument("--minimum-success-ratio", type=float, default=0.90)
+    parser.add_argument(
+        "--source-ips",
+        default="",
+        help="comma-separated local source IPv4 addresses",
+    )
+    return parser.parse_args()
+
+
+def parse_source_ips(raw: str) -> list[str]:
+    if not raw.strip():
+        return []
+
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for value in raw.split(","):
+        value = value.strip()
+        try:
+            address = ipaddress.IPv4Address(value)
+        except ipaddress.AddressValueError as error:
+            raise ValueError(f"invalid source IPv4: {value}") from error
+        if not any(address in network for network in ALLOWED_NETWORKS):
+            raise ValueError(f"source IP must be private or loopback: {address}")
+        normalized = str(address)
+        if normalized in seen:
+            raise ValueError(f"duplicate source IP: {normalized}")
+        seen.add(normalized)
+        addresses.append(normalized)
+
+    if len(addresses) > 64:
+        raise ValueError("at most 64 source IPs are allowed")
+    return addresses
+
+
+def validate(args: argparse.Namespace) -> list[str]:
+    address = ipaddress.ip_address(args.host)
+    if address.version != 4 or not (address.is_private or address.is_loopback):
+        raise ValueError("--host must be a private IPv4 address")
+    if not 1 <= args.port <= 65535:
+        raise ValueError("--port must be in 1..65535")
+    if not 1 <= args.vus <= 200:
+        raise ValueError("--vus must be in 1..200")
+    if not 5 <= args.duration <= 300:
+        raise ValueError("--duration must be in 5..300 seconds")
+    if not 0.0 <= args.minimum_success_ratio <= 1.0:
+        raise ValueError("--minimum-success-ratio must be in 0..1")
+    return parse_source_ips(args.source_ips)
+
+
+def main() -> None:
+    args = parse_args()
+    source_ips = validate(args)
+    deadline = time.monotonic() + args.duration
+    lock = threading.Lock()
+    totals = {"requests": 0, "successes": 0, "failures": 0}
+    latencies: list[float] = []
+
+    def worker(worker_id: int) -> None:
+        connection: http.client.HTTPConnection | None = None
+        source_ip = source_ips[worker_id % len(source_ips)] if source_ips else None
+        source_address = (source_ip, 0) if source_ip is not None else None
+        rng = random.Random(20261109 + worker_id)
+        while time.monotonic() < deadline:
+            started = time.perf_counter()
+            try:
+                if connection is None:
+                    connection = http.client.HTTPConnection(
+                        args.host,
+                        args.port,
+                        timeout=args.timeout,
+                        source_address=source_address,
+                    )
+                connection.request(
+                    "GET",
+                    "/",
+                    headers={
+                        "Host": args.host,
+                        "Connection": "keep-alive",
+                        "User-Agent": "syn-flood-final-holdout-normal-client",
+                    },
+                )
+                response = connection.getresponse()
+                response.read()
+                ok = response.status < 400
+                latency = (time.perf_counter() - started) * 1000
+            except (OSError, http.client.HTTPException):
+                ok = False
+                latency = None
+                if connection is not None:
+                    connection.close()
+                connection = None
+
+            with lock:
+                totals["requests"] += 1
+                if ok:
+                    totals["successes"] += 1
+                    if latency is not None:
+                        latencies.append(latency)
+                else:
+                    totals["failures"] += 1
+            time.sleep(0.2 + rng.random() * 0.8)
+
+        if connection is not None:
+            connection.close()
+
+    started_epoch = time.time()
+    started_monotonic = time.monotonic()
+    threads = [
+        threading.Thread(target=worker, args=(index,), daemon=True)
+        for index in range(args.vus)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    summary = {
+        "host": args.host,
+        "port": args.port,
+        "vus": args.vus,
+        "configured_duration_seconds": args.duration,
+        "configured_source_ips": source_ips,
+        "configured_source_count": len(source_ips) if source_ips else 1,
+        "actual_elapsed_seconds": time.monotonic() - started_monotonic,
+        "started_epoch": started_epoch,
+        **totals,
+        "success_ratio": (
+            totals["successes"] / totals["requests"] if totals["requests"] else 0.0
+        ),
+        "mean_latency_ms": statistics.fmean(latencies) if latencies else None,
+        "maximum_latency_ms": max(latencies) if latencies else None,
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if summary["success_ratio"] < args.minimum_success_ratio:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

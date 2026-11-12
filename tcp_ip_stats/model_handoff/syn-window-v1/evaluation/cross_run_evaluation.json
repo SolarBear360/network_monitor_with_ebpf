@@ -1,0 +1,138 @@
+{
+  "created_at_utc": "2026-11-08T15:00:39.136476+00:00",
+  "evaluation_mode": "leave_one_run_out",
+  "row_count": 1443,
+  "run_count": 2,
+  "label_counts": {
+    "0": 757,
+    "1": 686
+  },
+  "features": [
+    "tcp_packets",
+    "tcp_bytes",
+    "syn_only_packets",
+    "syn_ratio"
+  ],
+  "threshold": 0.5,
+  "models": {
+    "logistic_regression": {
+      "aggregate_out_of_fold": {
+        "threshold": 0.5,
+        "roc_auc": 0.9998266904421705,
+        "average_precision": 0.9998192312631327,
+        "accuracy": 0.9507969507969508,
+        "normal_precision": 0.9142512077294686,
+        "normal_recall": 1.0,
+        "normal_f1": 0.955205047318612,
+        "attack_precision": 1.0,
+        "attack_recall": 0.8965014577259475,
+        "attack_f1": 0.9454265949269792,
+        "confusion_matrix": {
+          "true_negative": 757,
+          "false_positive": 0,
+          "false_negative": 71,
+          "true_positive": 615
+        }
+      },
+      "per_test_run": {
+        "comprehensive_20261108_145857": {
+          "threshold": 0.5,
+          "roc_auc": 1.0,
+          "average_precision": 1.0,
+          "accuracy": 0.9502133712660028,
+          "normal_precision": 0.910941475826972,
+          "normal_recall": 1.0,
+          "normal_f1": 0.9533954727030626,
+          "attack_precision": 1.0,
+          "attack_recall": 0.8985507246376812,
+          "attack_f1": 0.9465648854961832,
+          "confusion_matrix": {
+            "true_negative": 358,
+            "false_positive": 0,
+            "false_negative": 35,
+            "true_positive": 310
+          }
+        },
+        "comprehensive_20261108_222636": {
+          "threshold": 0.5,
+          "roc_auc": 0.9998897537097876,
+          "average_precision": 0.9998764374443968,
+          "accuracy": 0.9513513513513514,
+          "normal_precision": 0.9172413793103448,
+          "normal_recall": 1.0,
+          "normal_f1": 0.9568345323741008,
+          "attack_precision": 1.0,
+          "attack_recall": 0.8944281524926686,
+          "attack_f1": 0.9442724458204335,
+          "confusion_matrix": {
+            "true_negative": 399,
+            "false_positive": 0,
+            "false_negative": 36,
+            "true_positive": 305
+          }
+        }
+      }
+    },
+    "random_forest": {
+      "aggregate_out_of_fold": {
+        "threshold": 0.5,
+        "roc_auc": 1.0,
+        "average_precision": 1.0,
+        "accuracy": 1.0,
+        "normal_precision": 1.0,
+        "normal_recall": 1.0,
+        "normal_f1": 1.0,
+        "attack_precision": 1.0,
+        "attack_recall": 1.0,
+        "attack_f1": 1.0,
+        "confusion_matrix": {
+          "true_negative": 757,
+          "false_positive": 0,
+          "false_negative": 0,
+          "true_positive": 686
+        }
+      },
+      "per_test_run": {
+        "comprehensive_20261108_145857": {
+          "threshold": 0.5,
+          "roc_auc": 1.0,
+          "average_precision": 1.0,
+          "accuracy": 1.0,
+          "normal_precision": 1.0,
+          "normal_recall": 1.0,
+          "normal_f1": 1.0,
+          "attack_precision": 1.0,
+          "attack_recall": 1.0,
+          "attack_f1": 1.0,
+          "confusion_matrix": {
+            "true_negative": 358,
+            "false_positive": 0,
+            "false_negative": 0,
+            "true_positive": 345
+          }
+        },
+        "comprehensive_20261108_222636": {
+          "threshold": 0.5,
+          "roc_auc": 1.0,
+          "average_precision": 1.0,
+          "accuracy": 1.0,
+          "normal_precision": 1.0,
+          "normal_recall": 1.0,
+          "normal_f1": 1.0,
+          "attack_precision": 1.0,
+          "attack_recall": 1.0,
+          "attack_f1": 1.0,
+          "confusion_matrix": {
+            "true_negative": 399,
+            "false_positive": 0,
+            "false_negative": 0,
+            "true_positive": 341
+          }
+        }
+      }
+    }
+  },
+  "final_model": "logistic_regression",
+  "final_fit_rows": 1443,
+  "quality_report_file": "data_quality_report.json"
+}

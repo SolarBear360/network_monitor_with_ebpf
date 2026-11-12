@@ -19,6 +19,12 @@
 #define BUCKET_NS 1000000000ULL  // 1 秒
 #define NUM_BUCKETS 64
 
+#ifdef ENABLE_TRACE
+#define debug_printk(fmt, ...) bpf_printk(fmt, ##__VA_ARGS__)
+#else
+#define debug_printk(fmt, ...) do { } while (0)
+#endif
+
 /*
  * TCP connection state
  */
@@ -195,13 +201,19 @@ int tc_tcp_flow(struct __sk_buff *skb)
     __u32 *host_ip;
 
     host_ip = bpf_map_lookup_elem(&target_ip_map, &host_ip_key);
+
+    // map lookup 的結果必須先檢查；否則 eBPF verifier 會拒絕載入程式。
+    if (!host_ip)
+        return TC_ACT_OK;
+
+#ifdef ENABLE_TRACE
     unsigned char hostIP_display[4];
     hostIP_display[0] = *host_ip & 0xFF; hostIP_display[1] = (*host_ip >> 8) & 0xFF; hostIP_display[2] = (*host_ip >> 16) & 0xFF; hostIP_display[3] = (*host_ip >> 24) & 0xFF;
-
-    bpf_printk("host ip: %d.%d.%d.%d\n",hostIP_display[0], hostIP_display[1], hostIP_display[2], hostIP_display[3]);
+    debug_printk("host ip: %d.%d.%d.%d\n",hostIP_display[0], hostIP_display[1], hostIP_display[2], hostIP_display[3]);
+#endif
 
     if (host_ip && ip->saddr == *host_ip) {
-        bpf_printk("packet send from host\n");
+        debug_printk("packet send from host\n");
         return TC_ACT_OK;
     }
 
@@ -211,16 +223,16 @@ int tc_tcp_flow(struct __sk_buff *skb)
     if ((void *)(tcp + 1) > data_end)
         return TC_ACT_OK;
 
-    //----------- debug --------------------
+#ifdef ENABLE_TRACE
     unsigned char s[4], d[4];
     s[0] = ip->saddr & 0xFF; s[1] = (ip->saddr >> 8) & 0xFF; s[2] = (ip->saddr >> 16) & 0xFF; s[3] = (ip->saddr >> 24) & 0xFF;
     d[0] = ip->daddr & 0xFF; d[1] = (ip->daddr >> 8) & 0xFF; d[2] = (ip->daddr >> 16) & 0xFF; d[3] = (ip->daddr >> 24) & 0xFF;
 
-    bpf_printk("TC [IPv4]: %d.%d.%d.%d -> %d.%d.%d.%d\n",
+    debug_printk("TC [IPv4]: %d.%d.%d.%d -> %d.%d.%d.%d\n",
                    s[0], s[1], s[2], s[3],
                    d[0], d[1], d[2], d[3]);
-    bpf_printk("syn : %d, ack : %d\n",tcp->syn,tcp->ack);
-    //----------- debug --------------------
+    debug_printk("syn : %d, ack : %d\n",tcp->syn,tcp->ack);
+#endif
 
     /*
      * ========================================
@@ -275,7 +287,7 @@ int tc_tcp_flow(struct __sk_buff *skb)
      */
 
     if (!stats) {
-        bpf_printk("---------------stats---------------\n");
+        debug_printk("---------------stats---------------\n");
         struct tcp_flow_stats new_stats = {};
 
         /*
@@ -362,12 +374,12 @@ int tc_tcp_flow(struct __sk_buff *skb)
         void *inner_map = bpf_map_lookup_elem(&tcp_bucket_maps, &bucket);
 
         if (!inner_map) {
-            bpf_printk("inner_map is NULL!\n");
+            debug_printk("inner_map is NULL!\n");
         }
         
         if (inner_map) {
             __u8 one = 1;
-            bpf_printk("into bucket: %p \n",bucket);
+            debug_printk("into bucket: %p \n",bucket);
             // 用 NOEXIST → 避免重複寫入（變 set）
             bpf_map_update_elem(inner_map, &key, &one, BPF_NOEXIST);
         }
