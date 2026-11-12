@@ -19,7 +19,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_STATS_CSV = SCRIPT_DIR / "tcp_stats.csv"
 DEFAULT_PREDICTION_CSV = SCRIPT_DIR / "syn_flood_predictions.csv"
 DEFAULT_RUNTIME_MODEL = (
-    SCRIPT_DIR / "model_handoff" / "syn-window-v1" / "runtime_model.json"
+    SCRIPT_DIR
+    / "model_handoff"
+    / "syn-window-full6-v1"
+    / "runtime_model.json"
 )
 
 STATS_CSV_FIELDS = [
@@ -54,6 +57,8 @@ PREDICTION_CSV_FIELDS = [
     "data_quality_reason",
 ]
 
+# ========= 基本設定 =========
+
 STATS_MAP_PATH = "/sys/fs/bpf/ip/globals/tcp_flow_map"
 SYS_BPF = 321  # x86_64
 
@@ -65,6 +70,8 @@ TCP_STATE_ESTABLISHED = 3
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
+
+# ========= struct 定義（要和 eBPF 完全一致） =========
 
 class FlowKey(ctypes.Structure):
     """Must stay byte-for-byte compatible with struct tcp_flow_key in eBPF."""
@@ -94,9 +101,13 @@ class FlowStats(ctypes.Structure):
     ]
 
 
+# PERCPU map 的每個 key 都會有一份「每 CPU 的 value」，所以讀取時要先
+# 建立可容納所有 CPU value 的陣列，之後再將它們加總。
 NCPU = os.cpu_count() or 1
 StatsArray = FlowStats * NCPU
 
+
+# ========= bpf_attr：傳給 bpf() system call 的參數格式 =========
 
 class BPFAttrObjGet(ctypes.Structure):
     _fields_ = [
@@ -123,6 +134,8 @@ class BPFAttrGetNextKey(ctypes.Structure):
     ]
 
 
+# ========= syscall wrapper =========
+
 def bpf_syscall(command, attribute):
     result = libc.syscall(
         SYS_BPF, command, ctypes.byref(attribute), ctypes.sizeof(attribute)
@@ -134,6 +147,8 @@ def bpf_syscall(command, attribute):
         raise OSError(error_number, os.strerror(error_number))
     return result
 
+
+# ========= 打開及讀取 pinned BPF map =========
 
 def get_map_fd(path):
     path_buffer = ctypes.create_string_buffer(path.encode())
@@ -153,7 +168,7 @@ def lookup_percpu(map_fd, key):
 
 
 def aggregate(values):
-    """Sum all per-CPU values for one flow key."""
+    """整合同一個 flow key 在每個 CPU 上的統計值。"""
     result = FlowStats()
     first = True
     for value in values:
@@ -162,10 +177,13 @@ def aggregate(values):
         result.syn += value.syn
         result.ack += value.ack
 
+        # first_seen 取所有 CPU 中最早的時間。
         if first or value.first_seen < result.first_seen:
             result.first_seen = value.first_seen
+        # last_seen 取所有 CPU 中最新的時間。
         if first or value.last_seen > result.last_seen:
             result.last_seen = value.last_seen
+        # connection_state 理論上各 CPU 相同，沿用原版作法取第一份。
         if first:
             result.connection_state = value.connection_state
         first = False
@@ -173,9 +191,10 @@ def aggregate(values):
 
 
 def iterate_keys(map_fd):
+    """逐一取得 map 中的 key，並複製成不會被下一輪覆蓋的物件。"""
     keys = []
     next_key = FlowKey()
-    key_pointer = 0
+    key_pointer = 0  # 第一次傳 NULL，要求取得 map 的第一個 key。
 
     while True:
         attribute = BPFAttrGetNextKey()
@@ -186,6 +205,7 @@ def iterate_keys(map_fd):
         if result is None:
             break
 
+        # 複製 key，避免 next_key 在下一輪 bpf() 呼叫時被覆蓋。
         copied_key = FlowKey()
         ctypes.memmove(
             ctypes.byref(copied_key), ctypes.byref(next_key), ctypes.sizeof(FlowKey)
@@ -197,7 +217,7 @@ def iterate_keys(map_fd):
 
 
 def counter_delta(current, previous):
-    """Treat a decreasing counter as a reset or a reused flow key."""
+    """計算累積值差；若下降則視為計數器重置或 flow key 被重用。"""
     return current - previous if current >= previous else current
 
 
@@ -207,7 +227,11 @@ def collect_snapshot(
     previous_syn_ips,
     previous_established_flows,
 ):
-    """Read the map and return deltas plus the state required by the next scan."""
+    """讀取一次 map，回傳本輪新增量與下一輪計算差值所需的狀態。"""
+
+    # ========================================
+    # 每一輪（一個 userspace 取樣窗口）的統計資料
+    # ========================================
     interval = {
         "tcp_packets": 0,
         "tcp_bytes": 0,
@@ -225,10 +249,13 @@ def collect_snapshot(
     syn_flows = set()
     current_established_flows = set()
 
+    # ========================================
+    # 取得目前所有 flow，保存累積值並與上一輪比較
+    # ========================================
     for key in iterate_keys(map_fd):
         values = lookup_percpu(map_fd, key)
         if values is None:
-            # A userspace expiry process may remove an entry during this scan.
+            # 過期清理程式可能在掃描期間刪除 Map 項目。
             continue
 
         result = aggregate(values)
@@ -236,6 +263,8 @@ def collect_snapshot(
         current = (result.packets, result.bytes, result.syn, result.ack)
         current_flow_stats[flow_key] = current
 
+        # BPF map 內是累積值；userspace 必須用「本輪 - 上輪」得到這個
+        # 取樣窗口真正新增的封包與 bytes。新 flow 則以目前值當新增量。
         previous = previous_flow_stats.get(flow_key)
         if previous is None:
             delta_packets, delta_bytes, delta_syn, delta_ack = current
@@ -248,23 +277,20 @@ def collect_snapshot(
         interval["tcp_packets"] += delta_packets
         interval["tcp_bytes"] += delta_bytes
 
-        # Count an inbound source once when at least one of its flows actually
-        # gained packets during this sampling window.  Unlike a last_seen
-        # comparison, this follows the real (possibly slightly longer than one
-        # second) userspace interval and counts the same active IP again in the
-        # next interval.
+        # 只要某來源的任一 flow 在本輪有新增封包，就把它算成本輪活動來源。
+        # 同一 IP 在同一輪只算一次；下一輪仍有送封包時會再次計入。
         if delta_packets > 0:
             active_source_ips.add(key.src_ip)
 
-        # Protect the model input from a transient non-atomic snapshot mismatch.
+        # 純 SYN = SYN 計數 - SYN/ACK 計數。max(0, ...) 可避免讀取多 CPU
+        # value 時短暫不一致而產生負數。
         delta_syn_only = max(0, delta_syn - delta_ack)
         interval["syn_only_packets"] += delta_syn_only
         interval["syn_ack_packets"] += delta_ack
 
-        # Count each inbound pure-SYN 5-tuple once in this sampling window.
-        # Retransmissions increase syn_only_packets but remain one tuple; if the
-        # same tuple sends another pure SYN in the next window, it is counted
-        # once again in that next window.
+        # 本輪收到純 SYN 的每個來源 IP／TCP 5-tuple 各只計一次。
+        # 同輪重傳會增加 syn_only_packets，但不會增加不同 IP 或 5-tuple；
+        # 下一輪又收到時，則會在新一輪重新計入。
         if delta_syn_only > 0:
             syn_source_ips.add(key.src_ip)
             syn_flows.add(flow_key)
@@ -273,6 +299,7 @@ def collect_snapshot(
         if cumulative_syn_only > 0:
             current_syn_ips.add(key.src_ip)
 
+        # 只有第一次觀察到 flow 進入 ESTABLISHED 時，才算一筆完成連線。
         if result.connection_state == TCP_STATE_ESTABLISHED:
             current_established_flows.add(flow_key)
             if flow_key not in previous_established_flows:
@@ -377,6 +404,7 @@ def print_interval(interval_seconds, interval):
 
 
 def main():
+    # ========= 主程式：初始化 map、模型與 CSV =========
     args = parse_args()
     detector = build_detector(args)
     stats_fd = get_map_fd(STATS_MAP_PATH)
@@ -404,8 +432,12 @@ def main():
         )
         print(f"預測 CSV：{args.prediction_csv}")
 
+    # 上一輪每個 flow 的累積數據：
+    # key = bytes(FlowKey)，value = (packets, bytes, syn, ack)。
     previous_flow_stats = {}
+    # 上一輪已觀察到 ESTABLISHED 的 flow，避免同一連線重複計數。
     previous_established_flows = set()
+    # 保留原版的歷史 SYN IP 狀態，供 collect_snapshot 回傳／後續擴充使用。
     previous_syn_ips = set()
     previous_sample_started = None
     first_iteration = True
@@ -448,9 +480,13 @@ def main():
                 first_iteration = False
 
                 if is_first_iteration:
-                    # Existing cumulative counters are not a complete one-second bucket.
+                    # 第一次掃描只建立累積值基準；Map 裡原本存在的資料並非
+                    # 完整的一秒窗口，因此不寫 CSV，也不交給模型。
                     print("已建立 BPF map 基準快照，下一秒開始預測。")
                 else:
+                    # ========================================
+                    # 時間、終端輸出與統計 CSV
+                    # ========================================
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     print_interval(interval_seconds, interval)
 
@@ -468,6 +504,9 @@ def main():
                     stats_file.flush()
 
                     if detector is not None:
+                        # ========================================
+                        # full_6 模型推論與預測 CSV
+                        # ========================================
                         detection = detector.evaluate(
                             tcp_packets=interval["tcp_packets"],
                             tcp_bytes=interval["tcp_bytes"],
@@ -515,7 +554,7 @@ def main():
                         ])
                         prediction_file.flush()
 
-                # Keep snapshot start times near one second apart.
+                # 扣掉本輪處理時間，使兩次快照的開始時間盡量相隔一秒。
                 remaining = 1.0 - (time.monotonic() - sample_started)
                 if remaining > 0:
                     time.sleep(remaining)

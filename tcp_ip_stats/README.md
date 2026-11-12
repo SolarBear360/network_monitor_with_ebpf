@@ -65,9 +65,17 @@ ebpf map如下 :
   同一 5-tuple 在同一輪內重傳只算一個，下一輪又收到純 SYN 時會再計入
 - `syn_source_ips` 會統計本輪確實收到純 SYN 的不同來源 IP；
   同一 IP 在同一輪使用多個 5-tuple 或重傳多個 SYN，仍只算一個
-- 每秒使用 `syn-window-v1` 進行一次 SYN Flood 推論
+- 每秒使用目前正式版 `syn-window-full6-v1`（實驗名稱 `full_6`）進行一次
+  SYN Flood 推論
+- `full_6` 的六個特徵是 `tcp_packets`、`tcp_bytes`、
+  `syn_only_packets`、`syn_ratio`、`active_source_ips` 與
+  `established_connections`；其中 `syn_ratio` 由 userspace 自動計算
 - 模型結果另存在 `syn_flood_predictions.csv`，不會破壞原本的
   `tcp_stats.csv` 格式
+
+舊的四特徵 `syn-window-v1` 仍保留在 `model_handoff/`，用途是比較與
+重現 baseline，不再是 `tcpip_stats.py` 預設載入的模型。正式六特徵模型的
+檔案、雜湊及評估摘要位於 `model_handoff/syn-window-full6-v1/`。
 
 新版 CSV 新增了 `active_source_ips`。如果目錄中已有舊格式的
 `tcp_stats.csv` 或 `syn_flood_predictions.csv`，程式會停止並提示先備份／改名，
@@ -83,6 +91,10 @@ ebpf map如下 :
 因為ebpf程式中使用了兩層map。掛載時，會先創立外層的map，再由tcpip_pakage_expire.py建立內部的map。過程中會有file directory相關操作，如果關閉了tcpip_pakage_expire.py，請務必也重新掛載ebpf程式(重新執行init.sh)，否則tcpip_pakage_expire.py會抓不到內部的file directory。
 
 ## SYN Flood 即時判斷
+
+目前預設載入 `model_handoff/syn-window-full6-v1/runtime_model.json`。
+這是 `full_6` Logistic Regression 模型匯出的輕量參數；root userspace
+不必安裝 scikit-learn，即可用 `syn_flood_runtime.py` 進行推論。
 
 預設使用以下暫定告警標準：
 
