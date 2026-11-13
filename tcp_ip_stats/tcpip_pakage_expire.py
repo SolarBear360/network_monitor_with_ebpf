@@ -6,6 +6,69 @@ import time
 import sys
 import ipaddress
 from collections import defaultdict
+import json
+import logging
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+
+
+# ========= BPF Map error logger =========
+
+LOG_DIR = "logs"
+LOG_FILE = os.path.join(LOG_DIR, "bpf_errors.jsonl")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        data = {
+            "timestamp": datetime.now().astimezone().isoformat(
+                timespec="microseconds"
+            ),
+            "level": record.levelname,
+            "map_name": getattr(record, "map_name", None),
+            "operation": getattr(record, "operation", None),
+            "map_fd": getattr(record, "map_fd", None),
+            "errno": getattr(record, "errno", None),
+            "error": getattr(record, "error", None),
+            "key": getattr(record, "key", None),
+            "message": record.getMessage(),
+        }
+
+        if record.exc_info:
+            data["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(data, ensure_ascii=False)
+
+
+logger = logging.getLogger("bpf_map")
+logger.setLevel(logging.ERROR)
+logger.propagate = False
+
+if not logger.handlers:
+    handler = RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8"
+    )
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+
+
+def log_map_error(map_name, operation, error, map_fd=None, key=None):
+    logger.error(
+        "BPF Map operation failed",
+        extra={
+            "map_name": map_name,
+            "operation": operation,
+            "map_fd": map_fd,
+            "errno": getattr(error, "errno", None),
+            "error": str(error),
+            "key": key,
+        },
+        exc_info=(type(error), error, error.__traceback__)
+    )
 
 # ========= 基本設定 =========
 STATS_MAP_PATH = "/sys/fs/bpf/ip/globals/tcp_flow_map"
@@ -141,7 +204,7 @@ class BPFAttrGetFDByID(ctypes.Structure):
     ]
 # ========= syscall wrapper =========
 
-def bpf_syscall(cmd, attr):
+def bpf_syscall(cmd, attr, enoent_is_none=False):
     attr_size = ctypes.sizeof(attr)
 
     ret = libc.syscall(
@@ -154,7 +217,7 @@ def bpf_syscall(cmd, attr):
     if ret < 0:
         err = ctypes.get_errno()
 
-        if err == 2:
+        if err == 2 and enoent_is_none:
             return None
 
         try:
@@ -205,14 +268,62 @@ def get_map_fd(path):
 
     return bpf_syscall(BPF_OBJ_GET, attr)
 
-def delete_elem(fd, key):
+def flow_key_to_str(key):
+    src_ip = ipaddress.IPv4Address(
+        key.src_ip.to_bytes(4, byteorder="little")
+    )
+    dst_ip = ipaddress.IPv4Address(
+        key.dst_ip.to_bytes(4, byteorder="little")
+    )
+
+    return (
+        f"{src_ip}:{key.src_port} -> "
+        f"{dst_ip}:{key.dst_port}, protocol={key.protocol}"
+    )
+
+
+def delete_elem(
+    fd,
+    key,
+    map_name="unknown",
+    key_description=None,
+    ignore_missing=True
+):
     attr = BPFAttrDelete()
     attr.map_fd = fd
     attr.key = ctypes.addressof(key)
 
-    bpf_syscall(BPF_MAP_DELETE_ELEM, attr)
+    try:
+        ret = bpf_syscall(
+            BPF_MAP_DELETE_ELEM,
+            attr,
+            enoent_is_none=ignore_missing
+        )
 
-def update_elem(map_fd, key_ptr, value_ptr, flags=0):
+        if ret is None:
+            return False
+
+        return True
+
+    except OSError as error:
+        log_map_error(
+            map_name=map_name,
+            operation="DELETE",
+            error=error,
+            map_fd=fd,
+            key=key_description
+        )
+        raise
+
+
+def update_elem(
+    map_fd,
+    key_ptr,
+    value_ptr,
+    flags=0,
+    map_name="unknown",
+    key_description=None
+):
     attr = BPFAttrUpdate()
 
     attr.map_fd = map_fd
@@ -220,16 +331,19 @@ def update_elem(map_fd, key_ptr, value_ptr, flags=0):
     attr.value = ctypes.addressof(value_ptr.contents)
     attr.flags = flags
 
-    ret = libc.syscall(SYS_BPF,
-                       BPF_MAP_UPDATE_ELEM,
-                       ctypes.byref(attr),
-                       ctypes.sizeof(attr))
+    try:
+        return bpf_syscall(BPF_MAP_UPDATE_ELEM, attr)
 
-    if ret != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, f"bpf_map_update_elem failed: {os.strerror(err)}")
+    except OSError as error:
+        log_map_error(
+            map_name=map_name,
+            operation="UPDATE",
+            error=error,
+            map_fd=map_fd,
+            key=key_description
+        )
+        raise
 
-    return 0
 
 # ============= utility ==================
 def ip_to_str(key: FlowKey):
@@ -245,7 +359,7 @@ def lookup_percpu(fd, key):
     attr.key = ctypes.addressof(key)
     attr.value = ctypes.addressof(values)
 
-    bpf_syscall(BPF_MAP_LOOKUP_ELEM, attr)
+    bpf_syscall(BPF_MAP_LOOKUP_ELEM, attr, enoent_is_none=True)
     return values
 
 # lookup_time本來是要用做讀取ebpf的 tcp_current_bucket 這個map
@@ -275,7 +389,9 @@ def lookup_inner_map_fd(outer_fd, index):
     attr.key = ctypes.addressof(key)
     attr.value = ctypes.addressof(value)
 
-    ret = bpf_syscall(BPF_MAP_LOOKUP_ELEM, attr)
+    ret = bpf_syscall(
+        BPF_MAP_LOOKUP_ELEM, attr, enoent_is_none=True
+    )
 
     if ret is None:
         return None
@@ -308,7 +424,9 @@ def iterate_keys(fd):
         attr.key = key_ptr
         attr.next_key = ctypes.addressof(next_key)
 
-        ret = bpf_syscall(BPF_MAP_GET_NEXT_KEY, attr)
+        ret = bpf_syscall(
+            BPF_MAP_GET_NEXT_KEY, attr, enoent_is_none=True
+        )
         if ret is None:
             break
 
@@ -329,7 +447,7 @@ def clear_bucket(stats_fd, bucket_fd, expired_idx, inner_fd):
 
     keys = iterate_keys(inner_fd)
 
-    print(f"{len(keys)} keys in current bucket\n")
+    print(f"{len(keys)} keys in current bucket \n")
 
     for key in keys:
         stats_values = lookup_percpu(stats_fd, key)
@@ -346,31 +464,40 @@ def clear_bucket(stats_fd, bucket_fd, expired_idx, inner_fd):
             now_ns - last_seen_ns > TIMEOUT_NS
         )
 
+        key_info = flow_key_to_str(key)
+
         if expired:
             print(
                 f"[EXPIRE] remove FlowKey from stats: "
-                f"src={ipaddress.IPv4Address(key.src_ip.to_bytes(4,"little"))}, "
-                f"dst={ipaddress.IPv4Address(key.dst_ip.to_bytes(4,"little"))}, "
+                f"{key_info}, "
                 f"last_seen={last_seen_ns}, "
                 f"idle={(now_ns - last_seen_ns) / 1e9:.2f}s"
             )
 
             # 從 stats_map 刪除統計紀錄
-            delete_elem(stats_fd, key)
+            delete_elem(
+                stats_fd,
+                key,
+                map_name="tcp_flow_map",
+                key_description=key_info
+            )
+
             # 無論是否逾期，都刪除目前 bucket 的 key
-            delete_elem(inner_fd, key)
+            delete_elem(
+                inner_fd,
+                key,
+                map_name=f"tcp_bucket_inner_{expired_idx}",
+                key_description=key_info
+            )
 
         else:
             print(
                 f"[KEEP] FlowKey still active: "
-                f"src={ipaddress.IPv4Address(key.src_ip.to_bytes(4,"little"))}, "
-                f"dst={ipaddress.IPv4Address(key.dst_ip.to_bytes(4,"little"))}, "
+                f"{key_info}, "
                 f"idle={(now_ns - last_seen_ns) / 1e9:.2f}s"
             )
 
 
-
-        
 def cleanup_buckets(stats_fd, bucket_fd, inner_fd_list):
     now_bucket = current_bucket()
 
@@ -428,7 +555,19 @@ def update_outer(outer_fd, index, inner_fd):
     attr.value = ctypes.addressof(value)
     attr.flags = 0
 
-    bpf_syscall(BPF_MAP_UPDATE_ELEM, attr)
+    try:
+        return bpf_syscall(BPF_MAP_UPDATE_ELEM, attr)
+
+    except OSError as error:
+        log_map_error(
+            map_name="tcp_bucket_maps",
+            operation="UPDATE",
+            error=error,
+            map_fd=outer_fd,
+            key=f"bucket_index={index}, inner_fd={inner_fd}"
+        )
+        raise
+
 
 def init_buckets(bucket_fd):
     inner_map_fd_list = []
@@ -446,7 +585,12 @@ def init_buckets(bucket_fd):
             f"inner_fd={inner_fd}"
         )
 
-        update_outer(bucket_fd, i, inner_fd)
+        try:
+            update_outer(bucket_fd, i, inner_fd)
+        except Exception:
+            os.close(inner_fd)
+            raise
+
         inner_map_fd_list.append(inner_fd)
 
     return inner_map_fd_list
@@ -470,7 +614,18 @@ def set_target_ip(map_fd, ip):
     attr.value = ctypes.addressof(value)
     attr.flags = BPF_ANY
 
-    bpf_syscall(BPF_MAP_UPDATE_ELEM, attr)
+    try:
+        return bpf_syscall(BPF_MAP_UPDATE_ELEM, attr)
+
+    except OSError as error:
+        log_map_error(
+            map_name="target_ip_map",
+            operation="UPDATE",
+            error=error,
+            map_fd=map_fd,
+            key=f"target_ip={ip}"
+        )
+        raise
 
 
 
