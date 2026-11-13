@@ -207,6 +207,8 @@ class BPFAttrGetFDByID(ctypes.Structure):
 # ========= syscall wrapper =========
 
 def bpf_syscall(cmd, attr, enoent_is_none=False):
+    global BPF_SYSCALL_SUCCESS_COUNT
+
     attr_size = ctypes.sizeof(attr)
 
     ret = libc.syscall(
