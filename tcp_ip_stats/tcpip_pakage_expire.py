@@ -33,6 +33,7 @@ class JsonFormatter(logging.Formatter):
             "error": getattr(record, "error", None),
             "key": getattr(record, "key", None),
             "message": record.getMessage(),
+            "success_count": getattr(record, "success_count", None),
         }
 
         if record.exc_info:
@@ -66,6 +67,7 @@ def log_map_error(map_name, operation, error, map_fd=None, key=None):
             "errno": getattr(error, "errno", None),
             "error": str(error),
             "key": key,
+            "success_count": BPF_SYSCALL_SUCCESS_COUNT,
         },
         exc_info=(type(error), error, error.__traceback__)
     )
@@ -104,7 +106,7 @@ TIMEOUT_NS = TIMEOUT_SECONDS * 1_000_000_000
 AF_INET = 2
 AF_INET6 = 10
 
-
+BPF_SYSCALL_SUCCESS_COUNT = 0
 
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 
@@ -251,6 +253,9 @@ def bpf_syscall(cmd, attr, enoent_is_none=False):
             f"BPF syscall failed: {err_name} "
             f"(errno={err}, cmd={cmd})"
         )
+
+    # syscall 成功
+    BPF_SYSCALL_SUCCESS_COUNT += 1
 
     return ret
 
